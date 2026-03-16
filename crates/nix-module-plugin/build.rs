@@ -1,8 +1,8 @@
-//! Build script for nix-module-system
+//! Build script for nix-module-plugin.
 //!
 //! This handles:
-//! 1. Finding Nix libraries via pkg-config (optional)
-//! 2. Compiling C++ FFI code (optional)
+//! 1. Finding Nix libraries via pkg-config
+//! 2. Compiling C++ FFI code
 //! 3. Setting up version-specific compatibility
 
 use std::env;
@@ -11,15 +11,6 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-changed=src/ffi/plugin.cpp");
     println!("cargo:rerun-if-changed=src/ffi/compat.h");
-
-    // Check if nix-ffi feature is enabled
-    let nix_ffi_enabled = env::var("CARGO_FEATURE_NIX_FFI").is_ok();
-
-    if !nix_ffi_enabled {
-        // Skip FFI compilation if feature not enabled
-        println!("cargo:warning=nix-ffi feature not enabled, skipping Nix C API integration");
-        return;
-    }
 
     // Find Nix libraries
     let nix_expr = match pkg_config::Config::new()
@@ -89,7 +80,7 @@ fn main() {
             }
         }
 
-        build.compile("nix_module_system_cpp");
+        build.compile("nix_module_plugin_cpp");
     }
 
     // Output directory for generated files

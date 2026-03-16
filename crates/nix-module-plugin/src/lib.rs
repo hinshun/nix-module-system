@@ -1,76 +1,14 @@
-//! # Nix Module System v2
+//! Nix plugin for the high-performance module system.
 //!
-//! A high-performance Nix module system implementation with:
-//! - Rust-based type checking and merging
-//! - No fixed-point evaluation
-//! - Beautiful error messages via ariadne
-//! - LSP support
-//!
-//! ## Architecture
-//!
-//! This crate provides Nix primops implemented in Rust for performance.
-//! The evaluation uses a staged pipeline instead of fixed-point iteration:
-//!
-//! 1. **Parse**: Extract module structure (imports, options, config)
-//! 2. **Collect**: Resolve imports and build dependency graph
-//! 3. **Declare**: Process option declarations (no config access needed)
-//! 4. **Define**: Merge config definitions using lattice unification
-//!
-//! ## Usage
-//!
-//! ### As a Library (Recommended)
-//!
-//! ```ignore
-//! use nix_module_system::api::{ModuleEvaluator, EvaluatedConfig};
-//!
-//! // Simple usage
-//! let config = ModuleEvaluator::new()
-//!     .add_file("./configuration.nix")?
-//!     .add_file("./hardware.nix")?
-//!     .evaluate()?;
-//!
-//! let nginx_port: i64 = config.get("services.nginx.port")?;
-//! let enabled: bool = config.get("services.nginx.enable")?;
-//!
-//! // With options introspection
-//! for option in config.options() {
-//!     println!("{}: {} = {:?}", option.path, option.type_desc, option.default);
-//! }
-//!
-//! // With error streaming
-//! let config = ModuleEvaluator::new()
-//!     .add_file("./config.nix")?
-//!     .on_diagnostic(|diag| eprintln!("{}", diag.message))
-//!     .evaluate()?;
-//! ```
-//!
-//! ### As a Nix Plugin
+//! This crate provides C FFI entry points for loading the module system
+//! as a Nix plugin:
 //!
 //! ```bash
-//! nix eval --plugin-files ./libnix_module_system.so --expr '...'
+//! nix eval --plugin-files ./libnix_module_plugin.so --expr '...'
 //! ```
-
-#![warn(missing_docs)]
-#![warn(clippy::all)]
-
-pub mod api;
-pub mod docs;
-pub mod errors;
-pub mod eval;
-pub mod ffi;
-pub mod merge;
-pub mod nix;
-pub mod parse;
-pub mod types;
-
-#[cfg(feature = "lsp")]
-pub mod lsp;
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic;
-
-/// Version of the module system
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Opaque handle to Nix EvalState
 #[repr(C)]
@@ -102,6 +40,18 @@ pub const FFI_TYPE_ERROR: FfiResult = -2;
 /// FFI not implemented error code
 pub const FFI_NOT_IMPLEMENTED: FfiResult = -3;
 
+/// FFI status codes
+pub mod status {
+    /// Operation succeeded
+    pub const OK: i32 = 0;
+    /// Generic error
+    pub const ERROR: i32 = -1;
+    /// Type error
+    pub const TYPE_ERROR: i32 = -2;
+    /// Memory allocation error
+    pub const ALLOC_ERROR: i32 = -3;
+}
+
 /// Check if a value matches a type.
 ///
 /// # Safety
@@ -132,8 +82,7 @@ pub unsafe extern "C" fn nms_check_type(
             Err(_) => return FFI_ERROR,
         };
 
-        // FFI type checking requires nix-ffi feature to be implemented
-        tracing::debug!("nms_check_type called with type: {} (not implemented)", type_name);
+        tracing::debug!("nms_check_type called with type: {}", type_name);
         FFI_NOT_IMPLEMENTED
     })
     .unwrap_or(FFI_ERROR)
@@ -157,8 +106,7 @@ pub unsafe extern "C" fn nms_merge_definitions(
     _result: *mut NixValue,
 ) -> FfiResult {
     panic::catch_unwind(|| {
-        // FFI merge requires nix-ffi feature to be implemented
-        tracing::debug!("nms_merge_definitions called (not implemented)");
+        tracing::debug!("nms_merge_definitions called");
         FFI_NOT_IMPLEMENTED
     })
     .unwrap_or(FFI_ERROR)
@@ -180,8 +128,7 @@ pub unsafe extern "C" fn nms_eval_modules(
     _result: *mut NixValue,
 ) -> FfiResult {
     panic::catch_unwind(|| {
-        // FFI evalModules requires nix-ffi feature to be implemented
-        tracing::debug!("nms_eval_modules called (not implemented)");
+        tracing::debug!("nms_eval_modules called");
         FFI_NOT_IMPLEMENTED
     })
     .unwrap_or(FFI_ERROR)
@@ -193,13 +140,10 @@ pub unsafe extern "C" fn nms_eval_modules(
 ///
 /// Returns a pointer to a static string. Do not free.
 /// The string is valid until the next FFI call from the same thread.
-/// Static message for unimplemented error retrieval
 static NOT_IMPLEMENTED_MSG: &[u8] = b"Error retrieval not implemented\0";
 
 #[no_mangle]
 pub unsafe extern "C" fn nms_get_error() -> *const c_char {
-    // Returns a static message indicating error storage is not implemented
-    // Full implementation would use thread-local storage
     NOT_IMPLEMENTED_MSG.as_ptr() as *const c_char
 }
 
@@ -238,6 +182,5 @@ mod tests {
         let version = unsafe { CStr::from_ptr(nms_version()) };
         let version_str = version.to_str().unwrap();
         assert!(!version_str.is_empty());
-        assert_eq!(version_str, VERSION);
     }
 }

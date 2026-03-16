@@ -10,13 +10,14 @@ repository = "https://github.com/hinshun/nix-module-system"
 name = "nix-module"
 path = "src/main.rs"
 
-[features]
-default = []
-nix-bindings = ["nix-module-system/nix-bindings"]
-
 [dependencies]
 # Core library
-nix-module-system = { path = "../.." }
+nix-module-system = { path = "../nix-module-system" }
+
+# Nix bindings for real evaluation
+nix-bindings-expr = { git = "https://github.com/nixops4/nix-bindings-rust" }
+nix-bindings-store = { git = "https://github.com/nixops4/nix-bindings-rust" }
+nix-bindings-util = { git = "https://github.com/nixops4/nix-bindings-rust" }
 
 # CLI parsing
 clap = { version = "4", features = ["derive", "env"] }

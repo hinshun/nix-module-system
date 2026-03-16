@@ -118,14 +118,3 @@ fn test_value_json_special_cases() {
     let json = value_to_json(&drv_value);
     assert!(json.is_object());
 }
-
-#[cfg(not(feature = "nix-bindings"))]
-#[test]
-fn test_evaluator_fallback() {
-    let config = NixConfig::default();
-    let mut evaluator = NixEvaluator::new(config).unwrap();
-
-    // Should return NotInitialized error without the feature
-    let result = evaluator.evaluate_expr("1 + 1");
-    assert!(matches!(result, Err(NixError::NotInitialized)));
-}

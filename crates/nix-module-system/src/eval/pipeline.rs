@@ -9,7 +9,6 @@
 use super::{CollectedModule, EvalResult, OptionInfo};
 use crate::errors::EvalError;
 use crate::merge::process_conditional;
-use crate::merge::MergeEngine;
 use crate::parse::{AttrName, Binding, Expr, Spanned};
 use crate::types::{Definition, OptionPath, Value};
 use indexmap::IndexMap;
@@ -72,8 +71,6 @@ pub struct Pipeline {
     definitions: IndexMap<OptionPath, Vec<ConfigDefinition>>,
     /// Merged option info
     options: IndexMap<OptionPath, OptionInfo>,
-    /// Merge engine
-    merge_engine: MergeEngine,
     /// Warnings accumulated during evaluation
     warnings: Vec<String>,
 }
@@ -87,7 +84,6 @@ impl Pipeline {
             declarations: IndexMap::new(),
             definitions: IndexMap::new(),
             options: IndexMap::new(),
-            merge_engine: MergeEngine::new(),
             warnings: Vec::new(),
         }
     }

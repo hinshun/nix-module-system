@@ -22,6 +22,7 @@
 //! ```
 
 mod commands;
+pub mod nix_eval;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -147,25 +148,6 @@ fn main() -> ExitCode {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
-
-    // Check for nix-bindings feature
-    #[cfg(not(feature = "nix-bindings"))]
-    {
-        if !cli.quiet {
-            eprintln!("Warning: nix-bindings feature not enabled.");
-            eprintln!("Real Nix evaluation requires the nix-bindings feature.");
-            eprintln!();
-            eprintln!("To enable, build with:");
-            eprintln!("  cargo build -p nix-module-cli --features nix-bindings");
-            eprintln!();
-            eprintln!("Or add to Cargo.toml:");
-            eprintln!("  [features]");
-            eprintln!("  default = [\"nix-bindings\"]");
-            eprintln!();
-            eprintln!("The CLI will use the built-in parser for basic operations.");
-            eprintln!();
-        }
-    }
 
     let result = match cli.command {
         Commands::Eval { ref files, ref attr, raw } => {

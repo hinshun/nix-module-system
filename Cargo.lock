@@ -1013,6 +1013,9 @@ dependencies = [
  "ariadne",
  "clap",
  "indexmap",
+ "nix-bindings-expr",
+ "nix-bindings-store",
+ "nix-bindings-util",
  "nix-module-system",
  "serde",
  "serde_json",
@@ -1023,24 +1026,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix-module-plugin"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libc",
+ "nix-module-system",
+ "pkg-config",
+ "tracing",
+]
+
+[[package]]
 name = "nix-module-system"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "ariadne",
  "async-lsp",
- "cc",
  "criterion",
  "dashmap",
  "futures",
  "indexmap",
  "insta",
- "libc",
  "lsp-types 0.97.0",
- "nix-bindings-expr",
- "nix-bindings-store",
- "nix-bindings-util",
- "pkg-config",
  "pretty_assertions",
  "serde",
  "serde_json",

@@ -57,27 +57,37 @@ pub enum ApiError {
     Eval(EvalError),
     /// Error reading a file
     Io {
+        /// The file path that caused the error.
         path: PathBuf,
+        /// The error message.
         message: String,
     },
     /// Error parsing source code
     Parse {
+        /// The file that failed to parse.
         file: PathBuf,
+        /// The parse errors encountered.
         errors: Vec<String>,
     },
     /// Configuration value not found
     NotFound {
+        /// The option path that was not found.
         path: String,
     },
     /// Type conversion error
     TypeMismatch {
+        /// The option path where the mismatch occurred.
         path: String,
+        /// The expected type.
         expected: &'static str,
+        /// The actual type found.
         found: String,
     },
     /// Invalid path format
     InvalidPath {
+        /// The invalid path string.
         path: String,
+        /// Description of what's wrong with the path.
         message: String,
     },
 }
@@ -154,12 +164,16 @@ pub enum ModuleSource {
     File(PathBuf),
     /// Module from a string source with a virtual filename
     String {
+        /// The Nix source code.
         source: String,
+        /// The virtual filename for error reporting.
         filename: PathBuf,
     },
     /// Module from a pre-parsed AST
     Ast {
+        /// The pre-parsed abstract syntax tree.
         ast: Spanned<Expr>,
+        /// The filename for error reporting.
         filename: PathBuf,
     },
 }
@@ -976,7 +990,7 @@ impl<'a> OptionQuery<'a> {
 
 impl EvaluatedConfig {
     /// Create a query builder for searching and filtering options.
-    pub fn query_options(&self) -> OptionQuery {
+    pub fn query_options(&self) -> OptionQuery<'_> {
         OptionQuery::new(self)
     }
 }

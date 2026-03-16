@@ -1,0 +1,20 @@
+[package]
+name = "nix-module-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "Nix plugin for the high-performance module system"
+license = "MIT"
+repository = "https://github.com/hinshun/nix-module-system"
+
+[lib]
+name = "nix_module_plugin"
+crate-type = ["cdylib"]
+
+[dependencies]
+nix-module-system = { path = "../nix-module-system" }
+libc = "0.2"
+tracing = "0.1"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

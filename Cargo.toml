@@ -1,81 +1,10 @@
 [workspace]
 members = [
-    ".",
+    "crates/nix-module-system",
     "crates/nix-module-cli",
+    "crates/nix-module-plugin",
 ]
-
-[package]
-name = "nix-module-system"
-version = "0.1.0"
-edition = "2021"
-description = "High-performance Nix module system with Rust primops"
-license = "MIT"
-repository = "https://github.com/hinshun/nix-module-system"
-
-[lib]
-name = "nix_module_system"
-crate-type = ["cdylib", "rlib"]
-
-[features]
-default = ["lsp"]
-lsp = ["async-lsp", "tower", "tokio"]
-nix-ffi = []  # Enable Nix C API integration (requires nix-expr-c, nix-store-c)
-nix-bindings = ["nix-bindings-expr", "nix-bindings-store", "nix-bindings-util"]  # Use nix-bindings-rust for evaluation
-
-[dependencies]
-# Error reporting
-ariadne = "0.4"
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Collections
-indexmap = { version = "2", features = ["serde"] }
-dashmap = "6"
-
-# Error handling
-thiserror = "2"
-anyhow = "1"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# FFI
-libc = "0.2"
-
-# LSP dependencies (optional)
-async-lsp = { version = "0.2", optional = true }
-tower = { version = "0.5", optional = true }
-tokio = { version = "1", features = ["full"], optional = true }
-lsp-types = "0.97"
-
-# Async
-futures = "0.3"
-
-# Nix bindings (optional)
-nix-bindings-expr = { git = "https://github.com/nixops4/nix-bindings-rust", optional = true }
-nix-bindings-store = { git = "https://github.com/nixops4/nix-bindings-rust", optional = true }
-nix-bindings-util = { git = "https://github.com/nixops4/nix-bindings-rust", optional = true }
-
-[build-dependencies]
-cc = "1"
-pkg-config = "0.3"
-
-[dev-dependencies]
-criterion = "0.5"
-pretty_assertions = "1"
-tempfile = "3"
-insta = { version = "1", features = ["yaml"] }
-
-[[bench]]
-name = "merge"
-harness = false
-
-[[bench]]
-name = "types"
-harness = false
+resolver = "2"
 
 [profile.release]
 lto = true

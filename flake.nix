@@ -62,11 +62,19 @@
         # Build just the cargo dependencies
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        # Build the actual crate
-        nix-module-system = craneLib.buildPackage (commonArgs // {
+        # Build the plugin (cdylib for nix eval --plugin-files)
+        nix-module-plugin = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
+          pname = "nix-module-plugin";
+          cargoExtraArgs = "-p nix-module-plugin";
+        });
 
-          # Additional test dependencies
+        # Build the CLI
+        nix-module-cli = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "nix-module-cli";
+          cargoExtraArgs = "-p nix-module-cli";
+
           nativeCheckInputs = with pkgs; [
             nix
           ];
@@ -90,17 +98,18 @@
 
       in {
         packages = {
-          default = nix-module-system;
-          inherit nix-module-system;
+          default = nix-module-cli;
+          cli = nix-module-cli;
+          plugin = nix-module-plugin;
           doc = nix-module-system-doc;
         };
 
         checks = {
-          inherit nix-module-system nix-module-system-clippy nix-module-system-fmt;
+          inherit nix-module-cli nix-module-plugin nix-module-system-clippy nix-module-system-fmt;
         };
 
         devShells.default = craneLib.devShell {
-          inputsFrom = [ nix-module-system ];
+          inputsFrom = [ nix-module-cli nix-module-plugin ];
 
           packages = with pkgs; [
             # Rust tools
@@ -124,20 +133,25 @@
             echo "Nix Module System Development Shell"
             echo "===================================="
             echo ""
+            echo "Crates:"
+            echo "  nix-module-system   Core library"
+            echo "  nix-module-cli      CLI (Rust drives Nix via nix-bindings)"
+            echo "  nix-module-plugin   Nix plugin (Nix loads Rust cdylib)"
+            echo ""
             echo "Commands:"
-            echo "  cargo build --release  Build the plugin"
-            echo "  cargo test             Run tests"
-            echo "  cargo clippy           Run linter"
+            echo "  cargo build -p nix-module-cli      Build the CLI"
+            echo "  cargo build -p nix-module-plugin    Build the plugin"
+            echo "  cargo test                          Run all tests"
             echo ""
             echo "To test the plugin:"
-            echo "  nix eval --plugin-files ./target/release/libnix_module_system.so --expr '...'"
+            echo "  nix eval --plugin-files ./target/release/libnix_module_plugin.so --expr '...'"
           '';
         };
 
         # For nix run
         apps.default = {
           type = "app";
-          program = "${nix-module-system}/bin/nix-module-system";
+          program = "${nix-module-cli}/bin/nix-module";
         };
       });
 }

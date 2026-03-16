@@ -12,29 +12,44 @@ use thiserror::Error;
 pub enum NixError {
     /// Initialization error - failed to initialize Nix library.
     #[error("failed to initialize Nix library: {message}")]
-    InitError { message: String },
+    InitError {
+        /// The error message.
+        message: String,
+    },
 
     /// Thread registration error.
     #[error("failed to register thread with Nix GC: {message}")]
-    ThreadRegistrationError { message: String },
+    ThreadRegistrationError {
+        /// The error message.
+        message: String,
+    },
 
     /// Store error - failed to open Nix store.
     #[error("failed to open Nix store: {message}")]
-    StoreError { message: String },
+    StoreError {
+        /// The error message.
+        message: String,
+    },
 
     /// Parse error - failed to parse Nix expression.
     #[error("parse error in {file}: {message}")]
     ParseError {
+        /// The file that failed to parse.
         file: PathBuf,
+        /// The error message.
         message: String,
+        /// Line number (1-indexed), if available.
         line: Option<usize>,
+        /// Column number (1-indexed), if available.
         column: Option<usize>,
     },
 
     /// Evaluation error - error during Nix evaluation.
     #[error("evaluation error: {message}")]
     EvaluationError {
+        /// The error message.
         message: String,
+        /// Stack trace frames.
         trace: Vec<TraceFrame>,
     },
 
@@ -76,10 +91,6 @@ pub enum NixError {
         /// The conversion error message.
         message: String,
     },
-
-    /// The evaluator is not initialized.
-    #[error("evaluator not initialized")]
-    NotInitialized,
 
     /// Generic error from nix-bindings-rust.
     #[error("{0}")]
@@ -278,7 +289,6 @@ fn error_code(err: &NixError) -> String {
         NixError::FileNotFound { .. } => "N0030".to_string(),
         NixError::IoError { .. } => "N0031".to_string(),
         NixError::ConversionError { .. } => "N0040".to_string(),
-        NixError::NotInitialized => "N0050".to_string(),
         NixError::Other(_) => "N0099".to_string(),
     }
 }
@@ -368,10 +378,6 @@ impl NixError {
             NixError::ConversionError { message } => UnifiedError::FfiError {
                 message: message.clone(),
                 external_code: Some("N0040".to_string()),
-            },
-            NixError::NotInitialized => UnifiedError::FfiError {
-                message: "evaluator not initialized".to_string(),
-                external_code: Some("N0050".to_string()),
             },
             NixError::Other(e) => UnifiedError::FfiError {
                 message: e.to_string(),

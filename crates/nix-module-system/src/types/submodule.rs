@@ -310,6 +310,7 @@ impl Submodule {
     ///
     /// Since we can't actually call Nix lambdas from Rust, this creates
     /// a representation that can be evaluated on the Nix side.
+    #[cfg(test)]
     fn apply_module_function(&mut self, args: ModuleArgs, file: Option<std::path::PathBuf>) -> Value {
         let mut unevaluated = UnevaluatedModule::new(args);
         unevaluated.file = file;

@@ -1,47 +1,14 @@
-//! High-level evaluation API for CLI tools and library consumers.
+//! High-level API for the module system.
 //!
-//! This module provides an ergonomic, developer-friendly API for evaluating
-//! Nix modules with the staged pipeline. It supports multiple input sources,
-//! streaming diagnostics, and typed access to configuration values.
-//!
-//! # Quick Start
-//!
-//! ```ignore
-//! use nix_module_system::api::{ModuleEvaluator, EvaluatedConfig};
-//!
-//! // Simple usage
-//! let config = ModuleEvaluator::new()
-//!     .add_file("./configuration.nix")?
-//!     .add_file("./hardware.nix")?
-//!     .evaluate()?;
-//!
-//! let nginx_port: i64 = config.get("services.nginx.port")?;
-//! let enabled: bool = config.get("services.nginx.enable")?;
-//! ```
-//!
-//! # With Options Introspection
-//!
-//! ```ignore
-//! for option in config.options() {
-//!     println!("{}: {} = {:?}", option.path, option.type_desc, option.default);
-//! }
-//! ```
-//!
-//! # With Error Streaming
-//!
-//! ```ignore
-//! let config = ModuleEvaluator::new()
-//!     .add_file("./config.nix")?
-//!     .on_diagnostic(|diag| eprintln!("{}", diag))
-//!     .evaluate()?;
-//! ```
+//! Provides typed access to evaluated configurations and option introspection.
+//! The actual evaluation is handled by the Nix evaluator (via `nix eval` with
+//! the plugin, or `evalModules` in `nix/lib.nix`). This module provides the
+//! Rust-side interface for processing results.
 
 use crate::errors::{Diagnostic, EvalError, Severity};
-use crate::eval::{collect_modules, filter_disabled, CollectedModule, EvalResult, OptionInfo, Pipeline};
-use crate::parse::{self, Expr, Spanned};
+use crate::eval::{EvalResult, OptionInfo};
 use crate::types::{OptionPath, Value};
 use indexmap::IndexMap;
-use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -61,13 +28,6 @@ pub enum ApiError {
         path: PathBuf,
         /// The error message.
         message: String,
-    },
-    /// Error parsing source code
-    Parse {
-        /// The file that failed to parse.
-        file: PathBuf,
-        /// The parse errors encountered.
-        errors: Vec<String>,
     },
     /// Configuration value not found
     NotFound {
@@ -99,13 +59,14 @@ impl fmt::Display for ApiError {
             ApiError::Io { path, message } => {
                 write!(f, "IO error for {}: {}", path.display(), message)
             }
-            ApiError::Parse { file, errors } => {
-                write!(f, "Parse errors in {}: {}", file.display(), errors.join(", "))
-            }
             ApiError::NotFound { path } => {
                 write!(f, "Configuration value not found: {}", path)
             }
-            ApiError::TypeMismatch { path, expected, found } => {
+            ApiError::TypeMismatch {
+                path,
+                expected,
+                found,
+            } => {
                 write!(
                     f,
                     "Type mismatch at {}: expected {}, found {}",
@@ -169,13 +130,6 @@ pub enum ModuleSource {
         /// The virtual filename for error reporting.
         filename: PathBuf,
     },
-    /// Module from a pre-parsed AST
-    Ast {
-        /// The pre-parsed abstract syntax tree.
-        ast: Spanned<Expr>,
-        /// The filename for error reporting.
-        filename: PathBuf,
-    },
 }
 
 impl ModuleSource {
@@ -192,17 +146,11 @@ impl ModuleSource {
         }
     }
 
-    /// Create a source from a pre-parsed AST
-    pub fn ast(ast: Spanned<Expr>, filename: PathBuf) -> Self {
-        ModuleSource::Ast { ast, filename }
-    }
-
     /// Get the filename for this source
     pub fn filename(&self) -> &Path {
         match self {
             ModuleSource::File(p) => p,
             ModuleSource::String { filename, .. } => filename,
-            ModuleSource::Ast { filename, .. } => filename,
         }
     }
 }
@@ -211,34 +159,19 @@ impl ModuleSource {
 // ModuleEvaluator Builder
 // ============================================================================
 
-/// Builder for configuring and running module evaluation.
+/// Builder for configuring module evaluation.
 ///
-/// Uses the builder pattern to configure evaluation options,
-/// add module sources, and execute the evaluation pipeline.
-///
-/// # Example
-///
-/// ```ignore
-/// let config = ModuleEvaluator::new()
-///     .add_file("./configuration.nix")?
-///     .add_string("{ config.my.option = true; }", "inline.nix")
-///     .root_dir("./")
-///     .on_diagnostic(|d| eprintln!("{}", d.message))
-///     .evaluate()?;
-/// ```
+/// In the new architecture, actual evaluation is handled by the Nix evaluator.
+/// This builder collects module sources and options, then delegates to Nix.
 pub struct ModuleEvaluator {
     /// Module sources to evaluate
     sources: Vec<ModuleSource>,
-    /// Disabled module keys
-    disabled: HashSet<String>,
     /// Root directory for resolving relative paths
     root_dir: Option<PathBuf>,
     /// Diagnostic callback
     diagnostic_callback: Option<DiagnosticCallback>,
     /// Collected diagnostics (if no callback)
     diagnostics: Vec<Diagnostic>,
-    /// Whether to continue on parse errors
-    lenient_parsing: bool,
     /// Whether to include internal options in introspection
     include_internal: bool,
 }
@@ -248,22 +181,14 @@ impl ModuleEvaluator {
     pub fn new() -> Self {
         Self {
             sources: Vec::new(),
-            disabled: HashSet::new(),
             root_dir: None,
             diagnostic_callback: None,
             diagnostics: Vec::new(),
-            lenient_parsing: false,
             include_internal: false,
         }
     }
 
     /// Add a module from a file path.
-    ///
-    /// The file will be read and parsed during evaluation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the path cannot be canonicalized.
     pub fn add_file<P: AsRef<Path>>(mut self, path: P) -> ApiResult<Self> {
         let path = path.as_ref();
         let abs_path = if path.is_absolute() {
@@ -287,8 +212,6 @@ impl ModuleEvaluator {
     }
 
     /// Add a module from a string source.
-    ///
-    /// The source will be parsed with the given virtual filename.
     pub fn add_string<S, P>(mut self, source: S, filename: P) -> Self
     where
         S: Into<String>,
@@ -298,15 +221,6 @@ impl ModuleEvaluator {
             source: source.into(),
             filename: filename.as_ref().to_path_buf(),
         });
-        self
-    }
-
-    /// Add a module from a pre-parsed AST.
-    ///
-    /// Use this when you've already parsed the module and want to
-    /// avoid re-parsing.
-    pub fn add_ast(mut self, ast: Spanned<Expr>, filename: PathBuf) -> Self {
-        self.sources.push(ModuleSource::Ast { ast, filename });
         self
     }
 
@@ -320,36 +234,12 @@ impl ModuleEvaluator {
     }
 
     /// Set the root directory for resolving relative paths.
-    ///
-    /// Defaults to the current working directory.
     pub fn root_dir<P: AsRef<Path>>(mut self, path: P) -> Self {
         self.root_dir = Some(path.as_ref().to_path_buf());
         self
     }
 
-    /// Disable a specific module by key (usually its file path).
-    pub fn disable_module<S: Into<String>>(mut self, key: S) -> Self {
-        self.disabled.insert(key.into());
-        self
-    }
-
-    /// Disable multiple modules.
-    pub fn disable_modules<I, S>(mut self, keys: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        for key in keys {
-            self.disabled.insert(key.into());
-        }
-        self
-    }
-
     /// Set a callback for receiving diagnostics during evaluation.
-    ///
-    /// The callback is invoked for each warning or error encountered.
-    /// If no callback is set, diagnostics are collected and available
-    /// via [`EvaluatedConfig::diagnostics()`].
     pub fn on_diagnostic<F>(mut self, callback: F) -> Self
     where
         F: Fn(&Diagnostic) + Send + Sync + 'static,
@@ -358,19 +248,7 @@ impl ModuleEvaluator {
         self
     }
 
-    /// Enable lenient parsing mode.
-    ///
-    /// In lenient mode, parse errors are recorded as diagnostics
-    /// but evaluation continues with successfully parsed modules.
-    pub fn lenient(mut self, lenient: bool) -> Self {
-        self.lenient_parsing = lenient;
-        self
-    }
-
     /// Include internal options in introspection results.
-    ///
-    /// By default, options marked as `internal = true` are excluded
-    /// from the options list.
     pub fn include_internal(mut self, include: bool) -> Self {
         self.include_internal = include;
         self
@@ -385,101 +263,27 @@ impl ModuleEvaluator {
         }
     }
 
-    /// Process a module source into a CollectedModule.
-    fn process_source(&mut self, source: ModuleSource) -> ApiResult<CollectedModule> {
-        match source {
-            ModuleSource::File(path) => {
-                // File will be processed by collect_modules
-                Ok(CollectedModule::new(path))
-            }
-            ModuleSource::String { source, filename } => {
-                match parse::parse_module(&source, filename.clone()) {
-                    Ok(ast) => Ok(CollectedModule::from_ast(filename, ast)),
-                    Err(errors) => {
-                        for err in &errors {
-                            self.emit_diagnostic(Diagnostic::error(&err.message).with_code("E0100"));
-                        }
-                        if self.lenient_parsing {
-                            Ok(CollectedModule::new(filename))
-                        } else {
-                            Err(ApiError::Parse {
-                                file: filename,
-                                errors: errors.into_iter().map(|e| e.message).collect(),
-                            })
-                        }
-                    }
-                }
-            }
-            ModuleSource::Ast { ast, filename } => Ok(CollectedModule::from_ast(filename, ast)),
-        }
-    }
-
-    /// Execute the evaluation pipeline and return the configuration.
+    /// Execute the evaluation and return the configuration.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - A file cannot be read
-    /// - Parsing fails (unless in lenient mode)
-    /// - Evaluation encounters a fatal error
-    pub fn evaluate(mut self) -> ApiResult<EvaluatedConfig> {
-        if self.sources.is_empty() {
-            // Return empty config for no sources
-            return Ok(EvaluatedConfig {
-                result: EvalResult {
-                    config: Value::Attrs(IndexMap::new()),
-                    options: IndexMap::new(),
-                    warnings: Vec::new(),
-                },
-                diagnostics: self.diagnostics,
-                include_internal: self.include_internal,
-            });
-        }
-
-        // Separate file sources from string/AST sources
-        let mut file_paths = Vec::new();
-        let mut inline_modules = Vec::new();
-
-        // Take ownership of sources to avoid borrow issues
-        let sources = std::mem::take(&mut self.sources);
-        for source in sources {
-            match source {
-                ModuleSource::File(path) => {
-                    file_paths.push(path);
-                }
-                other => {
-                    let module = self.process_source(other)?;
-                    inline_modules.push(module);
-                }
-            }
-        }
-
-        // Collect modules from file paths
-        let mut collected = if !file_paths.is_empty() {
-            collect_modules(file_paths, self.disabled.clone())?
-        } else {
-            Vec::new()
-        };
-
-        // Add inline modules
-        collected.extend(inline_modules);
-
-        // Filter disabled modules
-        let active = filter_disabled(collected);
-
-        // Run the evaluation pipeline
-        let result = Pipeline::new().with_modules(active).run()?;
-
-        // Convert warnings to diagnostics
-        for warning in &result.warnings {
-            self.emit_diagnostic(Diagnostic::warning(warning));
-        }
-
+    /// In the new architecture, evaluation is delegated to the Nix evaluator.
+    /// This method returns an empty config — the CLI or plugin integration
+    /// layer is responsible for driving `nix eval` and constructing the result.
+    pub fn evaluate(self) -> ApiResult<EvaluatedConfig> {
+        // Return empty config — actual evaluation happens via Nix
         Ok(EvaluatedConfig {
-            result,
+            result: EvalResult {
+                config: Value::Attrs(IndexMap::new()),
+                options: IndexMap::new(),
+                warnings: Vec::new(),
+            },
             diagnostics: self.diagnostics,
             include_internal: self.include_internal,
         })
+    }
+
+    /// Get the module sources configured on this evaluator.
+    pub fn sources(&self) -> &[ModuleSource] {
+        &self.sources
     }
 }
 
@@ -494,10 +298,6 @@ impl Default for ModuleEvaluator {
 // ============================================================================
 
 /// Result of evaluating modules, providing typed access to configuration.
-///
-/// This struct wraps the evaluation result and provides convenient methods
-/// for querying values with type conversion, introspecting options, and
-/// accessing diagnostics.
 #[derive(Debug)]
 pub struct EvaluatedConfig {
     /// The underlying evaluation result
@@ -509,40 +309,28 @@ pub struct EvaluatedConfig {
 }
 
 impl EvaluatedConfig {
+    /// Create an EvaluatedConfig from an EvalResult.
+    pub fn from_result(result: EvalResult) -> Self {
+        Self {
+            result,
+            diagnostics: Vec::new(),
+            include_internal: false,
+        }
+    }
+
     /// Get a typed configuration value at the given path.
-    ///
-    /// The path should be in dotted notation (e.g., "services.nginx.port").
-    ///
-    /// # Type Conversion
-    ///
-    /// This method supports automatic type conversion for:
-    /// - `i64`, `i32`, etc. - from `Value::Int`
-    /// - `f64`, `f32` - from `Value::Float`
-    /// - `bool` - from `Value::Bool`
-    /// - `String` - from `Value::String`
-    /// - `PathBuf` - from `Value::Path`
-    /// - `Vec<T>` - from `Value::List`
-    /// - `Option<T>` - returns `None` if path not found
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let port: i64 = config.get("services.nginx.port")?;
-    /// let enabled: bool = config.get("services.nginx.enable")?;
-    /// let hosts: Vec<String> = config.get("services.nginx.hosts")?;
-    /// ```
     pub fn get<T: FromValue>(&self, path: &str) -> ApiResult<T> {
         let option_path = OptionPath::from_dotted(path);
-        let value = self.result.get(&option_path).ok_or_else(|| ApiError::NotFound {
-            path: path.to_string(),
-        })?;
+        let value = self
+            .result
+            .get(&option_path)
+            .ok_or_else(|| ApiError::NotFound {
+                path: path.to_string(),
+            })?;
         T::from_value(value, path)
     }
 
     /// Try to get a configuration value, returning None if not found.
-    ///
-    /// Unlike `get()`, this returns `None` for missing values instead of
-    /// an error. Type conversion errors are still returned as errors.
     pub fn try_get<T: FromValue>(&self, path: &str) -> ApiResult<Option<T>> {
         let option_path = OptionPath::from_dotted(path);
         match self.result.get(&option_path) {
@@ -569,18 +357,12 @@ impl EvaluatedConfig {
     }
 
     /// Iterate over all declared options.
-    ///
-    /// Returns an iterator of OptionInfo structs containing metadata
-    /// about each option (path, type, default, description).
-    ///
-    /// By default, internal options are excluded. Use
-    /// [`ModuleEvaluator::include_internal`] to include them.
     pub fn options(&self) -> impl Iterator<Item = &OptionInfo> {
         let include_internal = self.include_internal;
-        self.result.options.values().filter(move |opt| {
-            // Filter internal options unless include_internal is set
-            include_internal || !opt.internal
-        })
+        self.result
+            .options
+            .values()
+            .filter(move |opt| include_internal || !opt.internal)
     }
 
     /// Get information about a specific option.
@@ -628,8 +410,6 @@ impl EvaluatedConfig {
     }
 
     /// Get the underlying EvalResult.
-    ///
-    /// Use this for advanced access to evaluation internals.
     pub fn into_result(self) -> EvalResult {
         self.result
     }
@@ -640,9 +420,6 @@ impl EvaluatedConfig {
 // ============================================================================
 
 /// Trait for converting from Nix Value to Rust types.
-///
-/// Implement this trait for custom types to enable direct conversion
-/// via `config.get::<YourType>("path")`.
 pub trait FromValue: Sized {
     /// Convert from a Value, returning an error if the type doesn't match.
     fn from_value(value: &Value, path: &str) -> ApiResult<Self>;
@@ -870,59 +647,10 @@ fn value_type_name(value: &Value) -> String {
 }
 
 // ============================================================================
-// Convenience Functions
-// ============================================================================
-
-/// Evaluate modules from file paths with default settings.
-///
-/// This is a convenience function for simple use cases.
-///
-/// # Example
-///
-/// ```ignore
-/// let config = evaluate_files(&["./configuration.nix"])?;
-/// let enabled: bool = config.get("services.nginx.enable")?;
-/// ```
-pub fn evaluate_files<P: AsRef<Path>>(paths: &[P]) -> ApiResult<EvaluatedConfig> {
-    let mut evaluator = ModuleEvaluator::new();
-    for path in paths {
-        evaluator = evaluator.add_file(path)?;
-    }
-    evaluator.evaluate()
-}
-
-/// Evaluate a single module from a string.
-///
-/// # Example
-///
-/// ```ignore
-/// let source = r#"{ config = { services.nginx.enable = true; }; }"#;
-/// let config = evaluate_string(source, "inline.nix")?;
-/// ```
-pub fn evaluate_string<S: Into<String>, P: AsRef<Path>>(
-    source: S,
-    filename: P,
-) -> ApiResult<EvaluatedConfig> {
-    ModuleEvaluator::new()
-        .add_string(source, filename)
-        .evaluate()
-}
-
-// ============================================================================
 // OptionQuery for Introspection
 // ============================================================================
 
 /// Query builder for filtering and searching options.
-///
-/// # Example
-///
-/// ```ignore
-/// let nginx_options: Vec<_> = config
-///     .query_options()
-///     .prefix("services.nginx")
-///     .with_type("bool")
-///     .collect();
-/// ```
 pub struct OptionQuery<'a> {
     config: &'a EvaluatedConfig,
     prefix: Option<String>,
@@ -964,19 +692,16 @@ impl<'a> OptionQuery<'a> {
         self.config
             .options()
             .filter(|opt| {
-                // Check prefix
                 if let Some(ref prefix) = self.prefix {
                     if !opt.path.to_dotted().starts_with(prefix) {
                         return false;
                     }
                 }
-                // Check type
                 if let Some(ref type_filter) = self.type_filter {
                     if !opt.type_desc.contains(type_filter) {
                         return false;
                     }
                 }
-                // Check default
                 if let Some(has_default) = self.has_default {
                     if has_default != opt.default.is_some() {
                         return false;
@@ -1007,7 +732,6 @@ mod tests {
     fn test_module_evaluator_new() {
         let evaluator = ModuleEvaluator::new();
         assert!(evaluator.sources.is_empty());
-        assert!(evaluator.disabled.is_empty());
     }
 
     #[test]
@@ -1117,7 +841,6 @@ mod tests {
 
     #[test]
     fn test_option_query() {
-        // This test just ensures OptionQuery compiles correctly
         let config = ModuleEvaluator::new().evaluate().unwrap();
         let _options: Vec<_> = config.query_options().prefix("services").collect();
     }

@@ -1,14 +1,13 @@
 //! The `options` command - list declared options with metadata.
 //!
-//! This command analyzes Nix modules and outputs information about
-//! declared options including their types, defaults, and descriptions.
+//! Analyzes Nix modules by evaluating them and extracting option declarations
+//! including types, defaults, and descriptions.
 
-use super::{collect_files, format_output, print_diagnostics, write_output};
+use super::{collect_files, format_output, write_output};
+use crate::nix_eval::{self, NixEvalConfig};
 use crate::{exit_codes, Cli, OutputFormat};
-use nix_module_system::api::{ApiError, ModuleEvaluator};
-use nix_module_system::errors::SourceCache;
+use nix_module_system::nix::value_to_json;
 use nix_module_system::types::Value;
-// indexmap is used via nix-module-system
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -20,15 +19,15 @@ pub struct OptionOutput {
     /// Type description.
     #[serde(rename = "type")]
     pub type_desc: String,
-    /// Default value (if any).
+    /// Default value (if any), serialized as plain JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub default: Option<Value>,
+    pub default: Option<serde_json::Value>,
     /// Description (if any).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Where the option was declared.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub declared_in: Vec<String>,
+    /// Whether this is an internal option.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub internal: bool,
 }
 
 /// Run the options command.
@@ -38,31 +37,16 @@ pub fn run(
     include_internal: bool,
     paths_only: bool,
     cli: &Cli,
+    eval_config: &NixEvalConfig,
 ) -> anyhow::Result<u8> {
-    // Collect all .nix files
     let file_paths = collect_files(files)?;
 
     if !cli.quiet {
         tracing::debug!("Analyzing {} files for options", file_paths.len());
     }
 
-    // Build the evaluator
-    let mut evaluator = ModuleEvaluator::new()
-        .include_internal(include_internal);
-
-    for path in &file_paths {
-        evaluator = evaluator.add_file(path)?;
-    }
-
-    // Run evaluation
-    let config = match evaluator.evaluate() {
-        Ok(cfg) => cfg,
-        Err(ApiError::Eval(e)) => {
-            if !cli.quiet {
-                eprintln!("error: {}", e);
-            }
-            return Ok(exit_codes::EVAL_ERROR);
-        }
+    let options_value = match nix_eval::eval_options(eval_config, &file_paths) {
+        Ok(v) => v,
         Err(e) => {
             if !cli.quiet {
                 eprintln!("error: {}", e);
@@ -71,33 +55,7 @@ pub fn run(
         }
     };
 
-    // Print any diagnostics
-    let mut cache = SourceCache::new();
-    print_diagnostics(config.diagnostics(), &mut cache, cli.quiet);
-
-    if config.has_errors() {
-        return Ok(exit_codes::EVAL_ERROR);
-    }
-
-    // Collect options
-    let options: Vec<OptionOutput> = config
-        .options()
-        .filter(|opt| {
-            // Filter by prefix if specified
-            if let Some(p) = prefix {
-                opt.path.to_dotted().starts_with(p)
-            } else {
-                true
-            }
-        })
-        .map(|opt| OptionOutput {
-            path: opt.path.to_dotted(),
-            type_desc: opt.type_desc.clone(),
-            default: opt.default.clone(),
-            description: opt.description.clone(),
-            declared_in: opt.declared_in.iter().map(|p| p.display().to_string()).collect(),
-        })
-        .collect();
+    let options = extract_options(&options_value, prefix, include_internal);
 
     if options.is_empty() {
         if !cli.quiet {
@@ -110,17 +68,13 @@ pub fn run(
         return Ok(exit_codes::SUCCESS);
     }
 
-    // Format output
     if paths_only {
-        // Simple list of paths
         let paths: Vec<&str> = options.iter().map(|o| o.path.as_str()).collect();
         let output = paths.join("\n");
         write_output(&output, cli)?;
     } else {
-        // Full option information
         match cli.format {
             OutputFormat::Nix => {
-                // Format as Nix attrset
                 let output = format_options_as_nix(&options);
                 write_output(&output, cli)?;
             }
@@ -138,6 +92,57 @@ pub fn run(
     Ok(exit_codes::SUCCESS)
 }
 
+/// Extract option information from the Nix evaluation result.
+fn extract_options(
+    value: &Value,
+    prefix: Option<&str>,
+    include_internal: bool,
+) -> Vec<OptionOutput> {
+    let mut options = Vec::new();
+
+    if let Value::Attrs(attrs) = value {
+        for (name, opt_value) in attrs {
+            if let Some(p) = prefix {
+                if !name.starts_with(p) {
+                    continue;
+                }
+            }
+
+            if let Value::Attrs(opt_attrs) = opt_value {
+                let internal = matches!(opt_attrs.get("internal"), Some(Value::Bool(true)));
+
+                if internal && !include_internal {
+                    continue;
+                }
+
+                let type_desc = match opt_attrs.get("type") {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => "unknown".to_string(),
+                };
+
+                let default = opt_attrs.get("default").and_then(|v| {
+                    if matches!(v, Value::Null) { None } else { Some(value_to_json(v)) }
+                });
+
+                let description = match opt_attrs.get("description") {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                };
+
+                options.push(OptionOutput {
+                    path: name.clone(),
+                    type_desc,
+                    default,
+                    description,
+                    internal,
+                });
+            }
+        }
+    }
+
+    options
+}
+
 /// Format options as a Nix expression.
 fn format_options_as_nix(options: &[OptionOutput]) -> String {
     let mut result = String::from("{\n");
@@ -151,15 +156,7 @@ fn format_options_as_nix(options: &[OptionOutput]) -> String {
         }
 
         if let Some(ref default) = opt.default {
-            result.push_str(&format!("    default = {};\n", format_value_nix(default)));
-        }
-
-        if !opt.declared_in.is_empty() {
-            result.push_str("    declaredIn = [\n");
-            for path in &opt.declared_in {
-                result.push_str(&format!("      \"{}\"\n", escape_nix(path)));
-            }
-            result.push_str("    ];\n");
+            result.push_str(&format!("    default = {};\n", format_json_as_nix(default)));
         }
 
         result.push_str("  };\n");
@@ -169,28 +166,24 @@ fn format_options_as_nix(options: &[OptionOutput]) -> String {
     result
 }
 
-/// Format a value as Nix (simple version).
-fn format_value_nix(value: &Value) -> String {
+/// Format a JSON value as Nix syntax.
+fn format_json_as_nix(value: &serde_json::Value) -> String {
     match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Int(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::String(s) => format!("\"{}\"", escape_nix(s)),
-        Value::Path(p) => p.display().to_string(),
-        Value::List(items) => {
-            let inner: Vec<_> = items.iter().map(format_value_nix).collect();
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => format!("\"{}\"", escape_nix(s)),
+        serde_json::Value::Array(items) => {
+            let inner: Vec<_> = items.iter().map(format_json_as_nix).collect();
             format!("[ {} ]", inner.join(" "))
         }
-        Value::Attrs(attrs) => {
+        serde_json::Value::Object(attrs) => {
             let inner: Vec<_> = attrs
                 .iter()
-                .map(|(k, v)| format!("{} = {};", k, format_value_nix(v)))
+                .map(|(k, v)| format!("{} = {};", k, format_json_as_nix(v)))
                 .collect();
             format!("{{ {} }}", inner.join(" "))
         }
-        Value::Lambda => "<lambda>".to_string(),
-        Value::Derivation(_) => "<derivation>".to_string(),
     }
 }
 
@@ -220,9 +213,9 @@ mod tests {
         let options = vec![OptionOutput {
             path: "test.enable".to_string(),
             type_desc: "bool".to_string(),
-            default: Some(Value::Bool(false)),
+            default: Some(serde_json::Value::Bool(false)),
             description: Some("Enable the test service".to_string()),
-            declared_in: vec!["test.nix".to_string()],
+            internal: false,
         }];
 
         let output = format_options_as_nix(&options);

@@ -22,8 +22,7 @@ pub struct DocumentState {
     pub content: String,
     /// Document version
     pub version: i32,
-    /// Parsed AST (if available)
-    pub ast: Option<crate::parse::Spanned<crate::parse::Expr>>,
+    // AST field removed — parsing is now handled by the Nix evaluator
 }
 
 impl DocumentState {
@@ -33,7 +32,6 @@ impl DocumentState {
             uri,
             content,
             version,
-            ast: None,
         }
     }
 
@@ -200,7 +198,6 @@ impl LspServer {
         if let Some(doc) = self.documents.get_mut(uri) {
             doc.content = content;
             doc.version = version;
-            doc.ast = None; // Invalidate AST
         }
     }
 

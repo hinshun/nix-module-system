@@ -1,186 +1,140 @@
-//! Nix plugin for the high-performance module system.
+//! Nix builtins plugin for the high-performance module system.
 //!
-//! This crate provides C FFI entry points for loading the module system
-//! as a Nix plugin:
+//! This crate is a cdylib loaded by the Nix evaluator via `--plugin-files`.
+//! It registers primop builtins that the Nix-side `evalModules` orchestrator
+//! calls for compute-intensive operations (merging, type checking, conditionals).
+//!
+//! ## Registered primops
+//!
+//! | Builtin | Arity | Purpose |
+//! |---------|-------|---------|
+//! | `__nms_version` | 0 | Returns plugin version string |
+//! | `__nms_checkType` | 2 | Type-check a value against a type descriptor |
+//! | `__nms_processConditionals` | 1 | Flatten mkIf/mkMerge/mkOverride wrappers |
+//! | `__nms_mergeDefinitions` | 3 | Merge multiple definitions for an option |
+//!
+//! ## Usage
 //!
 //! ```bash
-//! nix eval --plugin-files ./libnix_module_plugin.so --expr '...'
+//! nix eval --plugin-files ./libnix_module_plugin.so --expr 'builtins.__nms_version'
 //! ```
 
-use std::ffi::{c_char, c_int, c_void, CStr};
-use std::panic;
+mod ffi;
+mod primops;
+mod type_resolve;
 
-/// Opaque handle to Nix EvalState
-#[repr(C)]
-pub struct EvalState {
-    _private: [u8; 0],
-}
+use std::ffi::c_void;
+use std::ptr;
 
-/// Opaque handle to Nix Value
-#[repr(C)]
-pub struct NixValue {
-    _private: [u8; 0],
-}
-
-/// Opaque handle to Nix context for error reporting
-#[repr(C)]
-pub struct NixContext {
-    _private: [u8; 0],
-}
-
-/// Result type for FFI operations
-pub type FfiResult = c_int;
-
-/// FFI success code
-pub const FFI_OK: FfiResult = 0;
-/// FFI error code
-pub const FFI_ERROR: FfiResult = -1;
-/// FFI type error code
-pub const FFI_TYPE_ERROR: FfiResult = -2;
-/// FFI not implemented error code
-pub const FFI_NOT_IMPLEMENTED: FfiResult = -3;
-
-/// FFI status codes
-pub mod status {
-    /// Operation succeeded
-    pub const OK: i32 = 0;
-    /// Generic error
-    pub const ERROR: i32 = -1;
-    /// Type error
-    pub const TYPE_ERROR: i32 = -2;
-    /// Memory allocation error
-    pub const ALLOC_ERROR: i32 = -3;
-}
-
-/// Check if a value matches a type.
+/// Nix plugin entry point.
+///
+/// Called by the Nix evaluator when loading this shared library via `--plugin-files`.
+/// Registers all module system primops as builtins.
 ///
 /// # Safety
 ///
-/// - `ctx` must be a valid Nix context or null
-/// - `type_name` must be a valid null-terminated C string
-/// - `value` must be a valid Nix value pointer
-///
-/// # Returns
-///
-/// - `1` if the value matches the type
-/// - `0` if it doesn't match
-/// - `-1` on error
+/// Called by the Nix runtime. Must only register primops and return.
 #[no_mangle]
-pub unsafe extern "C" fn nms_check_type(
-    _ctx: *mut NixContext,
-    _state: *mut EvalState,
-    type_name: *const c_char,
-    _value: *mut NixValue,
-) -> FfiResult {
-    panic::catch_unwind(|| {
-        if type_name.is_null() {
-            return FFI_ERROR;
-        }
+pub unsafe extern "C" fn nix_plugin_entry() {
+    let ctx = ffi::nix_c_context_create();
+    if ctx.is_null() {
+        eprintln!("nix-module-plugin: failed to create nix context");
+        return;
+    }
 
-        let type_name = match CStr::from_ptr(type_name).to_str() {
-            Ok(s) => s,
-            Err(_) => return FFI_ERROR,
-        };
+    // Register __nms_version (arity 0)
+    register_primop(
+        ctx,
+        "__nms_version",
+        0,
+        &[],
+        "Returns the nix-module-system plugin version.",
+        primops::primop_version,
+    );
 
-        tracing::debug!("nms_check_type called with type: {}", type_name);
-        FFI_NOT_IMPLEMENTED
-    })
-    .unwrap_or(FFI_ERROR)
+    // Register __nms_checkType (arity 2)
+    register_primop(
+        ctx,
+        "__nms_checkType",
+        2,
+        &["typeDesc", "value"],
+        "Type-check a value against a type descriptor. Returns true/false.",
+        primops::primop_check_type,
+    );
+
+    // Register __nms_processConditionals (arity 1)
+    register_primop(
+        ctx,
+        "__nms_processConditionals",
+        1,
+        &["value"],
+        "Flatten mkIf/mkMerge/mkOverride wrappers into active definitions.",
+        primops::primop_process_conditionals,
+    );
+
+    // Register __nms_mergeDefinitions (arity 3)
+    register_primop(
+        ctx,
+        "__nms_mergeDefinitions",
+        3,
+        &["name", "typeDesc", "defs"],
+        "Merge multiple definitions for an option using its type's merge strategy.",
+        primops::primop_merge_definitions,
+    );
+
+    ffi::nix_c_context_free(ctx);
 }
 
-/// Merge multiple definitions according to a type's merge strategy.
+/// Helper to register a single primop.
 ///
 /// # Safety
 ///
-/// - `ctx` must be a valid Nix context or null
-/// - `state` must be a valid EvalState pointer
-/// - `type_ptr` must be a valid type handle from nms_create_type
-/// - `defs` must be a valid Nix list of definitions
-/// - `result` must be a valid pointer for writing the result
-#[no_mangle]
-pub unsafe extern "C" fn nms_merge_definitions(
-    _ctx: *mut NixContext,
-    _state: *mut EvalState,
-    _type_ptr: *mut c_void,
-    _defs: *mut NixValue,
-    _result: *mut NixValue,
-) -> FfiResult {
-    panic::catch_unwind(|| {
-        tracing::debug!("nms_merge_definitions called");
-        FFI_NOT_IMPLEMENTED
-    })
-    .unwrap_or(FFI_ERROR)
-}
+/// `ctx` must be a valid Nix context.
+unsafe fn register_primop(
+    ctx: *mut ffi::nix_c_context,
+    name: &str,
+    arity: i32,
+    arg_names: &[&str],
+    doc: &str,
+    fun: ffi::PrimOpFun,
+) {
+    use std::ffi::CString;
 
-/// Evaluate modules using the staged pipeline.
-///
-/// # Safety
-///
-/// - `ctx` must be a valid Nix context or null
-/// - `state` must be a valid EvalState pointer
-/// - `modules` must be a valid Nix list of modules
-/// - `result` must be a valid pointer for writing the result
-#[no_mangle]
-pub unsafe extern "C" fn nms_eval_modules(
-    _ctx: *mut NixContext,
-    _state: *mut EvalState,
-    _modules: *mut NixValue,
-    _result: *mut NixValue,
-) -> FfiResult {
-    panic::catch_unwind(|| {
-        tracing::debug!("nms_eval_modules called");
-        FFI_NOT_IMPLEMENTED
-    })
-    .unwrap_or(FFI_ERROR)
-}
+    let name_c = CString::new(name).expect("primop name");
+    let doc_c = CString::new(doc).expect("primop doc");
 
-/// Get the last error message.
-///
-/// # Safety
-///
-/// Returns a pointer to a static string. Do not free.
-/// The string is valid until the next FFI call from the same thread.
-static NOT_IMPLEMENTED_MSG: &[u8] = b"Error retrieval not implemented\0";
+    // Build args array (null-terminated array of C strings)
+    let arg_cstrings: Vec<CString> = arg_names
+        .iter()
+        .map(|a| CString::new(*a).expect("arg name"))
+        .collect();
+    let mut arg_ptrs: Vec<*const std::ffi::c_char> =
+        arg_cstrings.iter().map(|cs| cs.as_ptr()).collect();
+    arg_ptrs.push(ptr::null()); // null terminator
 
-#[no_mangle]
-pub unsafe extern "C" fn nms_get_error() -> *const c_char {
-    NOT_IMPLEMENTED_MSG.as_ptr() as *const c_char
-}
+    let primop = ffi::nix_alloc_primop(
+        ctx,
+        fun,
+        arity,
+        name_c.as_ptr(),
+        arg_ptrs.as_mut_ptr() as *mut *const std::ffi::c_char,
+        doc_c.as_ptr(),
+        ptr::null_mut::<c_void>(),
+    );
 
-/// Free a string allocated by this library.
-///
-/// # Safety
-///
-/// - `s` must be a pointer returned by an nms_* function
-/// - Must only be called once per string
-#[no_mangle]
-pub unsafe extern "C" fn nms_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        drop(std::ffi::CString::from_raw(s));
+    if primop.is_null() {
+        eprintln!("nix-module-plugin: failed to allocate primop '{}'", name);
+        return;
+    }
+
+    let err = ffi::nix_register_primop(ctx, primop);
+    if err != ffi::NIX_OK {
+        eprintln!(
+            "nix-module-plugin: failed to register primop '{}': error {}",
+            name, err
+        );
     }
 }
 
-/// Null-terminated version string for C FFI
-const VERSION_CSTR: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
-
-/// Get the library version.
-///
-/// # Safety
-///
-/// Returns a pointer to a static null-terminated string. Do not free.
-#[no_mangle]
-pub extern "C" fn nms_version() -> *const c_char {
-    VERSION_CSTR.as_ptr() as *const c_char
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_version() {
-        let version = unsafe { CStr::from_ptr(nms_version()) };
-        let version_str = version.to_str().unwrap();
-        assert!(!version_str.is_empty());
-    }
-}
+/// Library version for programmatic access.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -10,7 +10,7 @@ pub mod eval;
 pub mod options;
 
 use crate::{Cli, OutputFormat};
-use nix_module_system::errors::{render_diagnostic, render_to_terminal, DiagnosticReport, SourceCache};
+use nix_module_system::nix::value_to_json;
 use nix_module_system::types::Value;
 use serde::Serialize;
 use std::io::{self, Write};
@@ -39,10 +39,12 @@ pub fn write_output(output: &str, cli: &Cli) -> io::Result<()> {
 pub fn format_value(value: &Value, format: OutputFormat) -> anyhow::Result<String> {
     match format {
         OutputFormat::Json => {
-            Ok(serde_json::to_string_pretty(value)?)
+            let json = value_to_json(value);
+            Ok(serde_json::to_string_pretty(&json)?)
         }
         OutputFormat::Yaml => {
-            Ok(serde_yaml::to_string(value)?)
+            let json = value_to_json(value);
+            Ok(serde_yaml::to_string(&json)?)
         }
         OutputFormat::Nix => {
             Ok(format_as_nix(value))
@@ -53,16 +55,9 @@ pub fn format_value(value: &Value, format: OutputFormat) -> anyhow::Result<Strin
 /// Format any serializable value according to the output format.
 pub fn format_output<T: Serialize>(value: &T, format: OutputFormat) -> anyhow::Result<String> {
     match format {
-        OutputFormat::Json => {
-            Ok(serde_json::to_string_pretty(value)?)
-        }
-        OutputFormat::Yaml => {
-            Ok(serde_yaml::to_string(value)?)
-        }
-        OutputFormat::Nix => {
-            // For non-Value types, fall back to JSON
-            Ok(serde_json::to_string_pretty(value)?)
-        }
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(value)?),
+        OutputFormat::Yaml => Ok(serde_yaml::to_string(value)?),
+        OutputFormat::Nix => Ok(serde_json::to_string_pretty(value)?),
     }
 }
 
@@ -71,7 +66,6 @@ fn format_as_nix(value: &Value) -> String {
     format_as_nix_indent(value, 0)
 }
 
-/// Format a Value as Nix expression syntax with indentation.
 fn format_as_nix_indent(value: &Value, indent: usize) -> String {
     let spaces = "  ".repeat(indent);
     let inner_spaces = "  ".repeat(indent + 1);
@@ -82,12 +76,8 @@ fn format_as_nix_indent(value: &Value, indent: usize) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => {
             let s = f.to_string();
-            // Ensure it has a decimal point for Nix
-            if s.contains('.') || s.contains('e') || s.contains('E') {
-                s
-            } else {
-                format!("{}.0", s)
-            }
+            if s.contains('.') || s.contains('e') || s.contains('E') { s }
+            else { format!("{}.0", s) }
         }
         Value::String(s) => format!("\"{}\"", escape_nix_string(s)),
         Value::Path(p) => p.display().to_string(),
@@ -115,7 +105,6 @@ fn format_as_nix_indent(value: &Value, indent: usize) -> String {
                 let mut result = String::from("{\n");
                 for (key, val) in attrs {
                     result.push_str(&inner_spaces);
-                    // Quote key if needed
                     if needs_quoting(key) {
                         result.push_str(&format!("\"{}\"", escape_nix_string(key)));
                     } else {
@@ -132,37 +121,22 @@ fn format_as_nix_indent(value: &Value, indent: usize) -> String {
         }
         Value::Lambda => "<lambda>".to_string(),
         Value::Derivation(d) => {
-            // Show derivation as a special comment
             format!("/* derivation */ {}", format_as_nix_indent(d, indent))
         }
     }
 }
 
-/// Check if a value is "simple" (single line).
 fn is_simple_value(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_) | Value::Path(_)
-    )
+    matches!(value, Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_) | Value::Path(_))
 }
 
-/// Check if an attribute name needs quoting.
 fn needs_quoting(name: &str) -> bool {
-    if name.is_empty() {
-        return true;
-    }
-
-    // Must start with letter or underscore
+    if name.is_empty() { return true; }
     let first = name.chars().next().unwrap();
-    if !first.is_ascii_alphabetic() && first != '_' {
-        return true;
-    }
-
-    // Rest must be alphanumeric, underscore, or hyphen
+    if !first.is_ascii_alphabetic() && first != '_' { return true; }
     !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '\'')
 }
 
-/// Escape a string for Nix syntax.
 fn escape_nix_string(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for c in s.chars() {
@@ -185,14 +159,13 @@ pub fn collect_files(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 
     for path in paths {
         if path.is_dir() {
-            // Recursively find .nix files
             for entry in walkdir(path)? {
                 if entry.extension().map(|e| e == "nix").unwrap_or(false) {
                     files.push(entry);
                 }
             }
         } else if path.exists() {
-            files.push(path.clone());
+            files.push(std::fs::canonicalize(path)?);
         } else {
             anyhow::bail!("File not found: {}", path.display());
         }
@@ -205,58 +178,18 @@ pub fn collect_files(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Simple directory walker.
 fn walkdir(dir: &PathBuf) -> io::Result<Vec<PathBuf>> {
     let mut results = Vec::new();
-
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-
         if path.is_dir() {
             results.extend(walkdir(&path)?);
         } else {
-            results.push(path);
+            results.push(std::fs::canonicalize(&path)?);
         }
     }
-
     Ok(results)
-}
-
-/// Print diagnostics using ariadne.
-pub fn print_diagnostics(
-    diagnostics: &[nix_module_system::errors::Diagnostic],
-    cache: &mut SourceCache,
-    quiet: bool,
-) {
-    if quiet {
-        return;
-    }
-
-    for diag in diagnostics {
-        let rendered = render_diagnostic(diag, cache);
-        eprintln!("{}", rendered);
-    }
-}
-
-/// Print diagnostic reports using ariadne.
-///
-/// This function uses the new DiagnosticReport type with full ariadne rendering,
-/// producing colorful terminal output with source context, multi-span labels,
-/// and suggestions.
-pub fn print_reports(
-    reports: &[DiagnosticReport],
-    cache: &mut SourceCache,
-    quiet: bool,
-) {
-    if quiet {
-        return;
-    }
-
-    for report in reports {
-        let rendered = render_to_terminal(report, cache);
-        eprintln!("{}", rendered);
-    }
 }
 
 #[cfg(test)]

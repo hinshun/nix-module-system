@@ -11,10 +11,9 @@ name = "nix_module_plugin"
 crate-type = ["cdylib"]
 
 [dependencies]
-nix-module-system = { path = "../nix-module-system" }
-libc = "0.2"
-tracing = "0.1"
+nix-module-system = { path = "../nix-module-system", default-features = false }
+indexmap = { version = "2", features = ["serde"] }
+serde_json = "1"
 
 [build-dependencies]
-cc = "1"
 pkg-config = "0.3"

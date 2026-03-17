@@ -877,15 +877,6 @@ impl NixError {
         }
     }
 
-    /// Create a parse error from the parser's ParseError type.
-    pub fn from_parse_error(err: &crate::parse::ParseError) -> Self {
-        NixError::ParseError {
-            message: err.message.clone(),
-            span: SourceSpan::from(&err.span),
-            hints: err.hints.clone(),
-        }
-    }
-
     /// Create a multiple error from a list of errors.
     pub fn multiple(errors: Vec<NixError>) -> Self {
         if errors.len() == 1 {

@@ -14,15 +14,18 @@ path = "src/main.rs"
 # Core library
 nix-module-system = { path = "../nix-module-system" }
 
-# Nix bindings for real evaluation
+# Nix bindings for embedded evaluation
 nix-bindings-expr = { git = "https://github.com/nixops4/nix-bindings-rust" }
 nix-bindings-store = { git = "https://github.com/nixops4/nix-bindings-rust" }
 nix-bindings-util = { git = "https://github.com/nixops4/nix-bindings-rust" }
 
+# Dynamic loading for the plugin .so
+libloading = "0.8"
+
 # CLI parsing
 clap = { version = "4", features = ["derive", "env"] }
 
-# Error display (re-use ariadne via the library)
+# Error display
 ariadne = "0.4"
 
 # Serialization for output formats

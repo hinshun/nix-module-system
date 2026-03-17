@@ -1,122 +1,15 @@
 //! Integration tests for the Nix module system.
 //!
-//! These tests verify the complete evaluation pipeline from parsing
-//! through to final merged configuration.
+//! These tests verify the core module system logic: type checking, merging,
+//! conditional evaluation, and priority handling. Actual Nix parsing and
+//! evaluation is handled by the Nix evaluator.
 
-use nix_module_system::eval::{Pipeline, CollectedModule};
-use nix_module_system::parse::{parse, parse_module, Expr};
-use nix_module_system::types::{OptionPath, Value, Definition, Bool, Str, Int, ListOf, AttrsOf, NixType};
-use nix_module_system::merge::{MergeEngine, mk_if, mk_merge, process_conditional};
+use nix_module_system::types::{
+    AttrsOf, Bool, Definition, Int, ListOf, NixType, OptionPath, Str, Value,
+};
+use nix_module_system::merge::{mk_if, mk_merge, process_conditional, MergeEngine};
 use nix_module_system::errors::TypeError;
-use std::path::PathBuf;
 use indexmap::IndexMap;
-
-// ============================================================================
-// Parser Integration Tests
-// ============================================================================
-
-#[test]
-fn test_parse_simple_module() {
-    let source = r#"
-        { config, lib, ... }: {
-            options.services.test.enable = lib.mkEnableOption "test service";
-            config = lib.mkIf config.services.test.enable {
-                environment.systemPackages = [ pkgs.test ];
-            };
-        }
-    "#;
-
-    let result = parse_module(source, PathBuf::from("test.nix"));
-    assert!(result.is_ok(), "Failed to parse module: {:?}", result);
-
-    let ast = result.unwrap();
-    assert!(matches!(ast.node, Expr::Lambda(_)));
-}
-
-#[test]
-fn test_parse_devenv_style_module() {
-    let source = r#"
-        { config, lib, pkgs, ... }: {
-            devenv.languages.rust = {
-                enable = true;
-                version = "stable";
-            };
-            devenv.services.postgres.enable = true;
-            devenv.scripts.test = {
-                exec = "cargo test";
-                description = "Run tests";
-            };
-        }
-    "#;
-
-    let result = parse_module(source, PathBuf::from("devenv.nix"));
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_parse_mkoption_call() {
-    let source = r#"
-        mkOption {
-            type = types.bool;
-            default = false;
-            description = "Enable the feature";
-        }
-    "#;
-
-    let result = parse(source, PathBuf::from("test.nix"));
-    assert!(result.is_ok());
-
-    if let Ok(ast) = result {
-        if let Expr::Apply { func, arg } = ast.node {
-            assert!(matches!(func.node, Expr::Ident(ref name) if name == "mkOption"));
-            assert!(matches!(arg.node, Expr::AttrSet(_)));
-        } else {
-            panic!("Expected Apply expression");
-        }
-    }
-}
-
-#[test]
-fn test_parse_mkif_mkmerge() {
-    let source = r#"
-        lib.mkMerge [
-            (lib.mkIf config.enable {
-                settings.a = 1;
-            })
-            (lib.mkIf (!config.enable) {
-                settings.b = 2;
-            })
-            {
-                settings.c = 3;
-            }
-        ]
-    "#;
-
-    let result = parse(source, PathBuf::from("test.nix"));
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_parse_complex_attrset() {
-    let source = r#"
-        {
-            services.nginx = {
-                enable = true;
-                virtualHosts."example.com" = {
-                    root = "/var/www";
-                    locations."/".index = "index.html";
-                };
-            };
-            users.users.nginx = {
-                isSystemUser = true;
-                group = "nginx";
-            };
-        }
-    "#;
-
-    let result = parse(source, PathBuf::from("test.nix"));
-    assert!(result.is_ok());
-}
 
 // ============================================================================
 // Type System Tests
@@ -242,13 +135,6 @@ fn test_mkmerge_combines() {
 
 #[test]
 fn test_nested_conditionals() {
-    // mkMerge [
-    //   (mkIf true "included")
-    //   (mkIf false "excluded")
-    //   (mkMerge [
-    //     (mkIf true "nested-included")
-    //   ])
-    // ]
     let nested_merge = mk_merge(vec![
         mk_if(true, Value::String("nested-included".into())),
     ]);
@@ -289,9 +175,9 @@ fn test_merge_engine_with_priority() {
     let path = OptionPath::root();
 
     let defs = vec![
-        Definition::with_priority(Value::String("default".into()), 1000),  // mkDefault
-        Definition::with_priority(Value::String("forced".into()), 50),     // mkForce
-        Definition::with_priority(Value::String("normal".into()), 100),    // normal
+        Definition::with_priority(Value::String("default".into()), 1000),
+        Definition::with_priority(Value::String("forced".into()), 50),
+        Definition::with_priority(Value::String("normal".into()), 100),
     ];
 
     let result = engine.merge_option(&ty, &path, defs).unwrap();
@@ -350,11 +236,7 @@ fn test_value_display() {
 
 #[test]
 fn test_value_list() {
-    let list = Value::List(vec![
-        Value::Int(1),
-        Value::Int(2),
-        Value::Int(3),
-    ]);
+    let list = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
 
     if let Value::List(items) = list {
         assert_eq!(items.len(), 3);
@@ -371,29 +253,6 @@ fn test_value_attrs() {
     if let Value::Attrs(a) = value {
         assert_eq!(a.get("key"), Some(&Value::String("value".into())));
     }
-}
-
-// ============================================================================
-// Pipeline Tests
-// ============================================================================
-
-#[test]
-fn test_empty_pipeline() {
-    let result = Pipeline::new().run();
-    assert!(result.is_ok());
-
-    let eval_result = result.unwrap();
-    assert!(matches!(eval_result.config, Value::Attrs(_)));
-}
-
-#[test]
-fn test_pipeline_with_empty_module() {
-    let module = CollectedModule::new(PathBuf::from("empty.nix"));
-    let result = Pipeline::new()
-        .with_modules(vec![module])
-        .run();
-
-    assert!(result.is_ok());
 }
 
 // ============================================================================
@@ -430,19 +289,14 @@ fn test_undefined_option_error() {
 
 #[test]
 fn test_module_evaluation_scenario() {
-    // This test simulates evaluating a simple configuration
-
-    // Create a simple config as if it was parsed
     let mut config_attrs = IndexMap::new();
 
-    // services.test.enable = true
     let mut services = IndexMap::new();
     let mut test = IndexMap::new();
     test.insert("enable".to_string(), Value::Bool(true));
     services.insert("test".to_string(), Value::Attrs(test));
     config_attrs.insert("services".to_string(), Value::Attrs(services));
 
-    // users.users.test.isSystemUser = true
     let mut users = IndexMap::new();
     let mut users_inner = IndexMap::new();
     let mut test_user = IndexMap::new();
@@ -453,7 +307,6 @@ fn test_module_evaluation_scenario() {
 
     let config = Value::Attrs(config_attrs);
 
-    // Verify structure
     if let Value::Attrs(ref attrs) = config {
         assert!(attrs.contains_key("services"));
         assert!(attrs.contains_key("users"));
@@ -468,11 +321,6 @@ fn test_module_evaluation_scenario() {
 
 #[test]
 fn test_merge_scenario_with_conditionals() {
-    // Simulate: config = mkMerge [
-    //   { base = true; }
-    //   (mkIf condition { conditional = true; })
-    // ]
-
     let condition = true;
 
     let mut base = IndexMap::new();
@@ -493,23 +341,16 @@ fn test_merge_scenario_with_conditionals() {
 
 #[test]
 fn test_priority_override_scenario() {
-    // Simulate multiple modules setting the same option with different priorities
-
     let mut engine = MergeEngine::new();
     let ty = Int;
     let path = OptionPath::new(vec!["some".into(), "option".into()]);
 
     let defs = vec![
-        // Module 1: normal definition
         Definition::with_priority(Value::Int(100), 100),
-        // Module 2: mkDefault (lower priority)
         Definition::with_priority(Value::Int(200), 1000),
-        // Module 3: mkForce (highest priority)
         Definition::with_priority(Value::Int(42), 50),
     ];
 
     let result = engine.merge_option(&ty, &path, defs).unwrap();
-
-    // mkForce should win
     assert_eq!(result.value, Value::Int(42));
 }

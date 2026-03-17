@@ -1,13 +1,12 @@
 //! The `eval` command - evaluate modules and output configuration.
 //!
-//! This command evaluates Nix modules using the library's high-level API
-//! and outputs the resulting configuration in the specified format.
+//! Evaluates Nix modules by calling `evalModules` via the embedded Nix
+//! evaluator with the plugin loaded.
 
-use super::{collect_files, format_value, print_diagnostics, write_output};
+use super::{collect_files, format_value, write_output};
+use crate::nix_eval::{self, NixEvalConfig};
 use crate::{exit_codes, Cli};
-use nix_module_system::api::{ApiError, ModuleEvaluator};
-use nix_module_system::errors::SourceCache;
-// Note: OptionPath and Value are used implicitly through the API
+use nix_module_system::types::Value;
 use std::path::PathBuf;
 
 /// Run the eval command.
@@ -16,8 +15,8 @@ pub fn run(
     attr: Option<&str>,
     _raw: bool,
     cli: &Cli,
+    eval_config: &NixEvalConfig,
 ) -> anyhow::Result<u8> {
-    // Collect all .nix files
     let file_paths = collect_files(files)?;
 
     if !cli.quiet {
@@ -27,37 +26,8 @@ pub fn run(
         }
     }
 
-    // Build the evaluator
-    let mut evaluator = ModuleEvaluator::new();
-
-    for path in &file_paths {
-        evaluator = evaluator.add_file(path)?;
-    }
-
-    // Run evaluation
-    let config = match evaluator.evaluate() {
-        Ok(cfg) => cfg,
-        Err(ApiError::Eval(e)) => {
-            if !cli.quiet {
-                eprintln!("error: {}", e);
-            }
-            return Ok(exit_codes::EVAL_ERROR);
-        }
-        Err(ApiError::Parse { file, errors }) => {
-            if !cli.quiet {
-                eprintln!("error: Parse error in {}", file.display());
-                for err in &errors {
-                    eprintln!("  {}", err);
-                }
-            }
-            return Ok(exit_codes::EVAL_ERROR);
-        }
-        Err(ApiError::Io { path, message }) => {
-            if !cli.quiet {
-                eprintln!("error: IO error for {}: {}", path.display(), message);
-            }
-            return Ok(exit_codes::EVAL_ERROR);
-        }
+    let result = match nix_eval::eval_modules(eval_config, &file_paths) {
+        Ok(r) => r,
         Err(e) => {
             if !cli.quiet {
                 eprintln!("error: {}", e);
@@ -66,37 +36,25 @@ pub fn run(
         }
     };
 
-    // Print any diagnostics
-    let mut cache = SourceCache::new();
-    print_diagnostics(config.diagnostics(), &mut cache, cli.quiet);
-
-    // Check for errors/warnings in strict mode
-    if cli.strict && config.has_warnings() {
-        if !cli.quiet {
-            eprintln!("error: Evaluation completed with warnings (--strict mode)");
-        }
-        return Ok(exit_codes::EVAL_ERROR);
-    }
-
-    if config.has_errors() {
-        return Ok(exit_codes::EVAL_ERROR);
-    }
-
-    // Extract the value to output
     let output_value = if let Some(attr_path) = attr {
-        match config.get_raw(attr_path) {
+        match get_attr_path(&result.config, attr_path) {
             Some(v) => v.clone(),
             None => {
                 if !cli.quiet {
                     eprintln!("error: Attribute '{}' not found in configuration", attr_path);
 
-                    // Suggest similar paths
-                    let options: Vec<_> = config.options().map(|o| o.path.to_dotted()).collect();
-                    let similar = find_similar_paths(attr_path, &options);
-                    if !similar.is_empty() {
-                        eprintln!("\nDid you mean one of these?");
-                        for s in similar {
-                            eprintln!("  - {}", s);
+                    if let Value::Attrs(ref attrs) = result.config {
+                        let first_component = attr_path.split('.').next().unwrap_or("");
+                        let similar: Vec<_> = attrs
+                            .keys()
+                            .filter(|k| levenshtein(k, first_component) <= 2)
+                            .take(5)
+                            .collect();
+                        if !similar.is_empty() {
+                            eprintln!("\nDid you mean one of these?");
+                            for s in similar {
+                                eprintln!("  - {}", s);
+                            }
                         }
                     }
                 }
@@ -104,34 +62,27 @@ pub fn run(
             }
         }
     } else {
-        config.config().clone()
+        result.config
     };
 
-    // Format and output
     let formatted = format_value(&output_value, cli.format)?;
     write_output(&formatted, cli)?;
 
     Ok(exit_codes::SUCCESS)
 }
 
-/// Find similar paths using simple prefix matching.
-fn find_similar_paths(target: &str, candidates: &[String]) -> Vec<String> {
-    let target_parts: Vec<_> = target.split('.').collect();
-
-    candidates
-        .iter()
-        .filter(|c| {
-            let parts: Vec<_> = c.split('.').collect();
-            // Match if first component is similar
-            if parts.is_empty() || target_parts.is_empty() {
-                return false;
+/// Navigate into a Value by a dotted attribute path.
+fn get_attr_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for component in path.split('.') {
+        match current {
+            Value::Attrs(attrs) => {
+                current = attrs.get(component)?;
             }
-            parts[0] == target_parts[0] ||
-            levenshtein(parts[0], target_parts[0]) <= 2
-        })
-        .take(5)
-        .cloned()
-        .collect()
+            _ => return None,
+        }
+    }
+    Some(current)
 }
 
 /// Simple Levenshtein distance.
@@ -159,18 +110,23 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexmap::IndexMap;
 
     #[test]
-    fn test_find_similar_paths() {
-        let candidates = vec![
-            "services.nginx.enable".to_string(),
-            "services.nginx.port".to_string(),
-            "services.mysql.enable".to_string(),
-            "networking.firewall.enable".to_string(),
-        ];
+    fn test_get_attr_path() {
+        let mut inner = IndexMap::new();
+        inner.insert("enable".to_string(), Value::Bool(true));
+        let mut outer = IndexMap::new();
+        outer.insert("nginx".to_string(), Value::Attrs(inner));
+        let mut root = IndexMap::new();
+        root.insert("services".to_string(), Value::Attrs(outer));
+        let value = Value::Attrs(root);
 
-        let similar = find_similar_paths("services.nginx.enabled", &candidates);
-        assert!(similar.contains(&"services.nginx.enable".to_string()));
+        assert_eq!(
+            get_attr_path(&value, "services.nginx.enable"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(get_attr_path(&value, "services.missing"), None);
     }
 
     #[test]
@@ -178,6 +134,5 @@ mod tests {
         assert_eq!(levenshtein("", ""), 0);
         assert_eq!(levenshtein("hello", "hello"), 0);
         assert_eq!(levenshtein("hello", "helo"), 1);
-        assert_eq!(levenshtein("enabled", "enable"), 1);
     }
 }

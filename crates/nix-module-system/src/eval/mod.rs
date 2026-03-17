@@ -1,36 +1,10 @@
-//! Module evaluation engine.
+//! Module evaluation support types.
 //!
-//! This module implements the staged evaluation pipeline:
-//! 1. Parse - Extract module structure from Nix source
-//! 2. Collect - Resolve imports and build dependency graph
-//! 3. Declare - Process option declarations to build schema
-//! 4. Define - Merge config definitions using the type system
-//!
-//! ## Usage
-//!
-//! ```ignore
-//! use nix_module_system::eval::{eval_modules, collect_modules};
-//!
-//! // Evaluate modules from files
-//! let result = eval_modules(vec![PathBuf::from("configuration.nix")])?;
-//!
-//! // Or use the pipeline directly for more control
-//! let modules = collect_modules(roots, HashSet::new())?;
-//! let result = Pipeline::new().with_modules(modules).run()?;
-//! ```
+//! The actual evaluation is handled by the Nix evaluator. This module provides
+//! Rust-side types for representing evaluation results and option metadata.
 
-mod collect;
-mod pipeline;
-mod topo;
-
-pub use collect::*;
-pub use pipeline::*;
-pub use topo::*;
-
-use crate::errors::EvalError;
 use crate::types::{OptionPath, Value};
 use indexmap::IndexMap;
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// Result of evaluating modules
@@ -57,7 +31,7 @@ impl EvalResult {
 }
 
 /// Get a value at a path from a root value
-fn get_value_at_path<'a>(value: &'a Value, path: &OptionPath) -> Option<&'a Value> {
+pub fn get_value_at_path<'a>(value: &'a Value, path: &OptionPath) -> Option<&'a Value> {
     let components = path.components();
     if components.is_empty() {
         return Some(value);
@@ -132,41 +106,6 @@ impl OptionInfo {
         self.internal = internal;
         self
     }
-}
-
-/// Evaluate a list of modules.
-///
-/// This is the main entry point for module evaluation. It:
-/// 1. Collects all modules starting from the given roots
-/// 2. Resolves imports and builds the dependency graph
-/// 3. Processes option declarations
-/// 4. Merges config definitions
-///
-/// # Example
-///
-/// ```ignore
-/// let result = eval_modules(vec![PathBuf::from("configuration.nix")])?;
-/// println!("Config: {:?}", result.config);
-/// ```
-pub fn eval_modules(modules: Vec<PathBuf>) -> Result<EvalResult, EvalError> {
-    // Collect modules with import resolution
-    let collected = collect_modules(modules, HashSet::new())?;
-
-    // Filter disabled modules
-    let active = filter_disabled(collected);
-
-    // Run the evaluation pipeline
-    Pipeline::new().with_modules(active).run()
-}
-
-/// Evaluate modules with custom options.
-pub fn eval_modules_with_options(
-    modules: Vec<PathBuf>,
-    disabled: HashSet<String>,
-) -> Result<EvalResult, EvalError> {
-    let collected = collect_modules(modules, disabled)?;
-    let active = filter_disabled(collected);
-    Pipeline::new().with_modules(active).run()
 }
 
 #[cfg(test)]

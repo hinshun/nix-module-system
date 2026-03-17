@@ -1,25 +1,13 @@
 //! CLI for the Nix module system.
 //!
-//! A thin CLI wrapper around the nix-module-system library.
+//! Embeds a Nix evaluator with the nix-module-plugin loaded, providing
+//! accelerated module evaluation via Rust primops.
 //!
 //! # Commands
 //!
 //! - `nix-module eval <files...>` - Evaluate modules, output config as JSON/Nix
 //! - `nix-module check <files...>` - Check modules for errors without full eval
 //! - `nix-module options <files...>` - List declared options with types/defaults
-//!
-//! # Example
-//!
-//! ```bash
-//! # Evaluate modules
-//! nix-module eval configuration.nix hardware.nix --format json
-//!
-//! # Check for errors
-//! nix-module check ./config/*.nix --quiet
-//!
-//! # List options
-//! nix-module options ./modules/ --format yaml
-//! ```
 
 mod commands;
 pub mod nix_eval;
@@ -31,34 +19,28 @@ use tracing_subscriber::EnvFilter;
 
 /// Exit codes for the CLI.
 pub mod exit_codes {
-    /// Success.
     pub const SUCCESS: u8 = 0;
-    /// Evaluation error.
     pub const EVAL_ERROR: u8 = 1;
-    /// Usage/argument error.
     pub const USAGE_ERROR: u8 = 2;
 }
 
 /// Output format for results.
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 pub enum OutputFormat {
-    /// JSON format.
     #[default]
     Json,
-    /// Nix expression format.
     Nix,
-    /// YAML format.
     Yaml,
 }
 
 /// Nix module system CLI.
 ///
-/// A fast, Rust-based Nix module evaluator with beautiful error messages.
+/// Evaluates Nix modules using the Rust-accelerated plugin for fast merging,
+/// type checking, and conditional processing.
 #[derive(Parser)]
 #[command(name = "nix-module")]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
-    /// Subcommand to run.
     #[command(subcommand)]
     command: Commands,
 
@@ -74,16 +56,23 @@ pub struct Cli {
     #[arg(long, global = true)]
     strict: bool,
 
-    /// Quiet mode: suppress non-error output (for CI).
+    /// Quiet mode: suppress non-error output.
     #[arg(long, short = 'q', global = true)]
     quiet: bool,
 
     /// Enable debug logging.
     #[arg(long, global = true)]
     debug: bool,
+
+    /// Path to nix/lib.nix (auto-detected if not set).
+    #[arg(long, global = true, env = "NMS_LIB_PATH")]
+    lib_path: Option<PathBuf>,
+
+    /// Path to the plugin shared library (auto-detected if not set).
+    #[arg(long, global = true, env = "NMS_PLUGIN_PATH")]
+    plugin_path: Option<PathBuf>,
 }
 
-/// Available commands.
 #[derive(Subcommand)]
 pub enum Commands {
     /// Evaluate modules and output the resulting configuration.
@@ -92,7 +81,7 @@ pub enum Commands {
         #[arg(required = true)]
         files: Vec<PathBuf>,
 
-        /// Only output a specific attribute path.
+        /// Only output a specific attribute path (e.g., "services.nginx.enable").
         #[arg(long, short = 'A')]
         attr: Option<String>,
 
@@ -135,7 +124,6 @@ pub enum Commands {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Initialize logging
     let filter = if cli.debug {
         EnvFilter::new("debug")
     } else if cli.quiet {
@@ -149,15 +137,28 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
+    let eval_config = match nix_eval::NixEvalConfig::discover(
+        cli.lib_path.clone(),
+        cli.plugin_path.clone(),
+    ) {
+        Ok(config) => config,
+        Err(e) => {
+            if !cli.quiet {
+                eprintln!("error: {}", e);
+            }
+            return ExitCode::from(exit_codes::USAGE_ERROR);
+        }
+    };
+
     let result = match cli.command {
         Commands::Eval { ref files, ref attr, raw } => {
-            commands::eval::run(files, attr.as_deref(), raw, &cli)
+            commands::eval::run(files, attr.as_deref(), raw, &cli, &eval_config)
         }
         Commands::Check { ref files, warnings_as_errors } => {
-            commands::check::run(files, warnings_as_errors, &cli)
+            commands::check::run(files, warnings_as_errors, &cli, &eval_config)
         }
         Commands::Options { ref files, ref prefix, include_internal, paths_only } => {
-            commands::options::run(files, prefix.as_deref(), include_internal, paths_only, &cli)
+            commands::options::run(files, prefix.as_deref(), include_internal, paths_only, &cli, &eval_config)
         }
     };
 

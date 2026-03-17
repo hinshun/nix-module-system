@@ -1,421 +1,313 @@
-//! Real Nix evaluator using nix-bindings-rust.
+//! Nix evaluator using nix-bindings-rust.
 //!
-//! This module provides a full `NixEvaluator` that can evaluate Nix expressions
-//! by embedding a Nix `EvalState` in the Rust process.
+//! Embeds a Nix EvalState in the CLI process. Loads the nix-module-plugin
+//! shared library to register primops as builtins, then evaluates
+//! `evalModules` from `nix/lib.nix`.
 
-use nix_module_system::nix::error::{NixError, NixResult, TraceFrame};
-use nix_module_system::nix::NixConfig;
 use nix_module_system::types::Value;
 
 use nix_bindings_expr::eval_state::{gc_register_my_thread, init, EvalState, ThreadRegistrationGuard};
-use nix_bindings_expr::value::Value as NixBindingsValue;
 use nix_bindings_store::store::Store;
 
-use indexmap::IndexMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 
-/// Global initialization flag.
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Configuration for the Nix evaluator.
+#[derive(Debug, Clone)]
+pub struct NixEvalConfig {
+    /// Path to the nix/lib.nix file.
+    pub lib_path: PathBuf,
+    /// Path to the plugin shared library.
+    pub plugin_path: PathBuf,
+}
 
-/// Initialize the Nix library.
-///
-/// This must be called once before creating any evaluators.
-/// It's safe to call multiple times.
-pub fn initialize() -> NixResult<()> {
-    if INITIALIZED.swap(true, Ordering::SeqCst) {
-        return Ok(());
+impl NixEvalConfig {
+    /// Create a new config, discovering paths automatically.
+    pub fn discover(
+        lib_path: Option<PathBuf>,
+        plugin_path: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        let lib_path = lib_path
+            .or_else(|| std::env::var("NMS_LIB_PATH").ok().map(PathBuf::from))
+            .or_else(find_lib_nix)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot find nix/lib.nix. Set --lib-path, NMS_LIB_PATH, or run from the project root."
+                )
+            })?;
+
+        if !lib_path.exists() {
+            anyhow::bail!("lib.nix not found at: {}", lib_path.display());
+        }
+
+        let plugin_path = plugin_path
+            .or_else(|| std::env::var("NMS_PLUGIN_PATH").ok().map(PathBuf::from))
+            .or_else(find_plugin)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot find nix-module-plugin shared library. \
+                     Set --plugin-path, NMS_PLUGIN_PATH, or build with `cargo build -p nix-module-plugin`."
+                )
+            })?;
+
+        if !plugin_path.exists() {
+            anyhow::bail!("Plugin not found at: {}", plugin_path.display());
+        }
+
+        Ok(Self {
+            lib_path,
+            plugin_path,
+        })
     }
+}
 
-    init().map_err(|e| NixError::InitError {
-        message: e.to_string(),
-    })
+/// Result of evaluating modules.
+#[derive(Debug)]
+pub struct NixEvalResult {
+    /// The merged configuration.
+    pub config: Value,
 }
 
 /// High-level Nix evaluator backed by nix-bindings-rust.
+///
+/// On creation, loads the plugin .so to register primops as builtins,
+/// then creates an EvalState with those builtins available.
 pub struct NixEvaluator {
-    /// The evaluation state.
     eval_state: EvalState,
-    /// Thread registration guard.
     _guard: ThreadRegistrationGuard,
-    /// Configuration.
-    config: NixConfig,
+    /// Keep the library handle alive so symbols remain loaded.
+    _plugin: libloading::Library,
 }
 
 impl NixEvaluator {
-    /// Create a new evaluator with the given configuration.
-    pub fn new(config: NixConfig) -> NixResult<Self> {
-        initialize()?;
+    /// Create a new evaluator, loading the plugin and initializing Nix.
+    ///
+    /// Order matters:
+    /// 1. Initialize Nix library
+    /// 2. Load plugin .so (calls nix_plugin_entry, registers builtins)
+    /// 3. Create EvalState (builtins now include __nms_* primops)
+    pub fn new(eval_config: &NixEvalConfig) -> anyhow::Result<Self> {
+        // Step 1: Initialize Nix (idempotent)
+        init().map_err(|e| anyhow::anyhow!("Failed to initialize Nix: {}", e))?;
 
-        let guard = gc_register_my_thread().map_err(|e| NixError::ThreadRegistrationError {
-            message: e.to_string(),
-        })?;
-
-        let store = Store::open(config.store_uri.as_deref(), config.store_params.clone())
-            .map_err(|e| NixError::StoreError {
-                message: e.to_string(),
+        // Step 2: Load plugin .so and call nix_plugin_entry()
+        let plugin = unsafe {
+            let lib = libloading::Library::new(&eval_config.plugin_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to load plugin {}: {}",
+                    eval_config.plugin_path.display(),
+                    e
+                )
             })?;
 
-        let eval_state = EvalState::new(store, config.lookup_paths.clone()).map_err(|e| {
-            NixError::InitError {
-                message: e.to_string(),
-            }
-        })?;
+            // Call the plugin entry point to register primops
+            let entry: libloading::Symbol<unsafe extern "C" fn()> =
+                lib.get(b"nix_plugin_entry").map_err(|e| {
+                    anyhow::anyhow!(
+                        "Plugin {} missing nix_plugin_entry symbol: {}",
+                        eval_config.plugin_path.display(),
+                        e
+                    )
+                })?;
+            entry();
+
+            lib
+        };
+
+        // Step 3: Create EvalState (primops are now registered as builtins)
+        let guard = gc_register_my_thread()
+            .map_err(|e| anyhow::anyhow!("Failed to register GC thread: {}", e))?;
+
+        let store = Store::open(None, Vec::<(&str, &str)>::new())
+            .map_err(|e| anyhow::anyhow!("Failed to open Nix store: {}", e))?;
+
+        let eval_state = EvalState::new(store, Vec::<&str>::new())
+            .map_err(|e| anyhow::anyhow!("Failed to create EvalState: {}", e))?;
 
         Ok(Self {
             eval_state,
             _guard: guard,
-            config,
+            _plugin: plugin,
         })
     }
 
-    /// Evaluate a Nix expression from a string.
-    pub fn evaluate_expr(&mut self, expr: &str) -> NixResult<Value> {
-        self.evaluate_expr_with_source(expr, "<expr>")
-    }
-
-    /// Evaluate a Nix expression with a custom source name.
-    pub fn evaluate_expr_with_source(
-        &mut self,
-        expr: &str,
-        source_name: &str,
-    ) -> NixResult<Value> {
+    /// Evaluate a Nix expression string to a string result.
+    pub fn eval_string(&mut self, expr: &str) -> anyhow::Result<String> {
         let nix_value = self
             .eval_state
-            .eval_from_string(expr, source_name)
-            .map_err(|e| parse_nix_error(e, source_name))?;
+            .eval_from_string(expr, "<cli>")
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        nix_to_value(&mut self.eval_state, &nix_value)
+        self.eval_state
+            .require_string(&nix_value)
+            .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
-    /// Evaluate a Nix file.
-    pub fn evaluate_file(&mut self, path: impl AsRef<Path>) -> NixResult<Value> {
-        let path = path.as_ref();
+    /// Evaluate a Nix expression and return its JSON serialization as a Value.
+    ///
+    /// Wraps the expression in `builtins.toJSON (...)` so Nix handles
+    /// serialization (including lazy forcing), then parses the resulting
+    /// JSON string on the Rust side.
+    pub fn eval_json(&mut self, expr: &str) -> anyhow::Result<Value> {
+        let json_str = self.eval_string(&format!("builtins.toJSON ({})", expr))?;
 
-        if !path.exists() {
-            return Err(NixError::FileNotFound {
-                path: path.to_path_buf(),
-            });
-        }
+        let json: serde_json::Value = serde_json::from_str(&json_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse Nix JSON output: {}", e))?;
 
-        let contents = std::fs::read_to_string(path).map_err(|e| NixError::IoError {
-            message: format!("failed to read {}: {}", path.display(), e),
-        })?;
-
-        let source_name = path.to_string_lossy();
-        self.evaluate_expr_with_source(&contents, &source_name)
-    }
-
-    /// Evaluate a Nix expression and return a lazy value.
-    pub fn evaluate_lazy(&mut self, expr: &str) -> NixResult<LazyValue> {
-        let nix_value = self
-            .eval_state
-            .eval_from_string(expr, "<expr>")
-            .map_err(|e| parse_nix_error(e, "<expr>"))?;
-
-        Ok(LazyValue::new(nix_value))
-    }
-
-    /// Evaluate a Nix expression and extract an attribute.
-    pub fn evaluate_attr(&mut self, expr: &str, attr: &str) -> NixResult<Value> {
-        let full_expr = format!("({}).{}", expr, attr);
-        self.evaluate_expr(&full_expr)
-    }
-
-    /// Call a Nix function with an argument.
-    pub fn call_function(&mut self, func_expr: &str, arg: &Value) -> NixResult<Value> {
-        let func_value = self
-            .eval_state
-            .eval_from_string(func_expr, "<function>")
-            .map_err(|e| parse_nix_error(e, "<function>"))?;
-
-        let arg_value = value_to_nix(&mut self.eval_state, arg)?;
-
-        let result = self
-            .eval_state
-            .call(func_value, arg_value)
-            .map_err(|e| NixError::evaluation(e.to_string()))?;
-
-        nix_to_value(&mut self.eval_state, &result)
-    }
-
-    /// Import a Nix file and return its value.
-    pub fn import(&mut self, path: impl AsRef<Path>) -> NixResult<Value> {
-        let path = path.as_ref();
-        let expr = format!("import {}", path.display());
-        self.evaluate_expr(&expr)
-    }
-
-    /// Evaluate with builtins available in scope.
-    pub fn evaluate_with_builtins(&mut self, expr: &str) -> NixResult<Value> {
-        self.evaluate_expr(expr)
-    }
-
-    /// Get the raw EvalState for advanced operations.
-    pub fn eval_state(&mut self) -> &mut EvalState {
-        &mut self.eval_state
-    }
-
-    /// Get the configuration.
-    pub fn config(&self) -> &NixConfig {
-        &self.config
+        Ok(nix_module_system::nix::json_to_value(&json))
     }
 }
 
-/// Convert a Nix value to our internal Value type.
-pub fn nix_to_value(state: &mut EvalState, nix_val: &NixBindingsValue) -> NixResult<Value> {
-    use nix_bindings_expr::value::ValueType;
+/// Evaluate modules using the embedded Nix evaluator.
+pub fn eval_modules(
+    eval_config: &NixEvalConfig,
+    module_files: &[PathBuf],
+) -> anyhow::Result<NixEvalResult> {
+    let mut evaluator = NixEvaluator::new(eval_config)?;
 
-    let val_type = state.value_type(nix_val);
+    let lib_path = eval_config.lib_path.display();
+    let modules = module_files
+        .iter()
+        .map(|p| format!("    {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    match val_type {
-        ValueType::Null => Ok(Value::Null),
+    let expr = format!(
+        r#"let
+  lib = import {lib_path};
+  result = lib.evalModules {{
+    modules = [
+{modules}
+    ];
+  }};
+in result.config"#
+    );
 
-        ValueType::Bool => {
-            let b = state
-                .require_bool(nix_val)
-                .map_err(|e| NixError::evaluation(e.to_string()))?;
-            Ok(Value::Bool(b))
+    tracing::debug!("Evaluating:\n{}", expr);
+
+    let config = evaluator.eval_json(&expr)?;
+    Ok(NixEvalResult { config })
+}
+
+/// Quick test: evaluate `builtins.nms_version` to verify primops work.
+pub fn test_primops(eval_config: &NixEvalConfig) -> anyhow::Result<String> {
+    let mut evaluator = NixEvaluator::new(eval_config)?;
+    evaluator.eval_string("builtins.nms_version")
+}
+
+/// Check modules for errors by forcing full evaluation.
+pub fn check_modules(
+    eval_config: &NixEvalConfig,
+    module_files: &[PathBuf],
+) -> anyhow::Result<()> {
+    eval_modules(eval_config, module_files)?;
+    Ok(())
+}
+
+/// Evaluate modules and extract option declarations.
+pub fn eval_options(
+    eval_config: &NixEvalConfig,
+    module_files: &[PathBuf],
+) -> anyhow::Result<Value> {
+    let mut evaluator = NixEvaluator::new(eval_config)?;
+
+    let lib_path = eval_config.lib_path.display();
+    let modules = module_files
+        .iter()
+        .map(|p| format!("    {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let expr = format!(
+        r#"let
+  lib = import {lib_path};
+  result = lib.evalModules {{
+    modules = [
+{modules}
+    ];
+  }};
+  formatOption = name: opt: {{
+    path = name;
+    type = opt.type.name or "unknown";
+    default = opt.default or null;
+    description = opt.description or null;
+    internal = opt.internal or false;
+  }};
+in lib.mapAttrs formatOption result.options"#
+    );
+
+    tracing::debug!("Evaluating:\n{}", expr);
+
+    evaluator.eval_json(&expr)
+}
+
+// ---------------------------------------------------------------------------
+// Path discovery
+// ---------------------------------------------------------------------------
+
+/// Try to find nix/lib.nix relative to the executable or CWD.
+fn find_lib_nix() -> Option<PathBuf> {
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("nix/lib.nix");
+        if candidate.exists() {
+            return Some(candidate);
         }
+    }
 
-        ValueType::Int => {
-            let i = state
-                .require_int(nix_val)
-                .map_err(|e| NixError::evaluation(e.to_string()))?;
-            Ok(Value::Int(i))
-        }
-
-        ValueType::Float => {
-            let f = state
-                .require_float(nix_val)
-                .map_err(|e| NixError::evaluation(e.to_string()))?;
-            Ok(Value::Float(f))
-        }
-
-        ValueType::String => {
-            let s = state
-                .require_string(nix_val)
-                .map_err(|e| NixError::evaluation(e.to_string()))?;
-            Ok(Value::String(s))
-        }
-
-        ValueType::Path => {
-            let p = state
-                .require_path(nix_val)
-                .map_err(|e| NixError::evaluation(e.to_string()))?;
-            Ok(Value::Path(PathBuf::from(p)))
-        }
-
-        ValueType::List => {
-            let size = state
-                .require_list_size(nix_val)
-                .map_err(|e| NixError::evaluation(e.to_string()))?;
-
-            let mut elements = Vec::with_capacity(size as usize);
-            for i in 0..size {
-                if let Some(elem) = state
-                    .require_list_select_idx_strict(nix_val, i)
-                    .map_err(|e| NixError::evaluation(e.to_string()))?
-                {
-                    elements.push(nix_to_value(state, &elem)?);
-                }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let candidate = exe_dir.join("../share/nix-module-system/nix/lib.nix");
+            if candidate.exists() {
+                return Some(candidate);
             }
-            Ok(Value::List(elements))
         }
+    }
 
-        ValueType::Attrs => {
-            // Check if this is a derivation
-            if let Ok(Some(type_val)) = state.require_attrs_select_opt(nix_val, "type") {
-                if let Ok(type_str) = state.require_string(&type_val) {
-                    if type_str == "derivation" {
-                        let inner = nix_attrs_to_value(state, nix_val)?;
-                        return Ok(Value::Derivation(Box::new(inner)));
-                    }
-                }
+    None
+}
+
+/// Try to find the plugin shared library.
+fn find_plugin() -> Option<PathBuf> {
+    // Try build output locations (for development)
+    let candidates = [
+        "target/release/libnix_module_plugin.so",
+        "target/debug/libnix_module_plugin.so",
+        "target/release/libnix_module_plugin.dylib",
+        "target/debug/libnix_module_plugin.dylib",
+    ];
+
+    if let Ok(cwd) = std::env::current_dir() {
+        for candidate in &candidates {
+            let path = cwd.join(candidate);
+            if path.exists() {
+                return Some(path);
             }
-
-            nix_attrs_to_value(state, nix_val)
-        }
-
-        ValueType::Lambda | ValueType::PrimOp | ValueType::PrimOpApp => Ok(Value::Lambda),
-
-        ValueType::Thunk => {
-            state
-                .force(nix_val)
-                .map_err(|e| NixError::evaluation(e.to_string()))?;
-            nix_to_value(state, nix_val)
-        }
-
-        ValueType::External => {
-            Err(NixError::conversion("cannot convert external value"))
-        }
-    }
-}
-
-/// Convert Nix attrs to our Value::Attrs.
-fn nix_attrs_to_value(state: &mut EvalState, nix_val: &NixBindingsValue) -> NixResult<Value> {
-    let names = state
-        .require_attrs_names(nix_val)
-        .map_err(|e| NixError::evaluation(e.to_string()))?;
-
-    let mut attrs = IndexMap::with_capacity(names.len());
-    for name in names {
-        let attr_val = state
-            .require_attrs_select(nix_val, &name)
-            .map_err(|e| NixError::evaluation(e.to_string()))?;
-        attrs.insert(name, nix_to_value(state, &attr_val)?);
-    }
-
-    Ok(Value::Attrs(attrs))
-}
-
-/// Convert our Value type to a Nix value.
-pub fn value_to_nix(state: &mut EvalState, value: &Value) -> NixResult<NixBindingsValue> {
-    match value {
-        Value::Null => state
-            .new_value_null()
-            .map_err(|e| NixError::evaluation(e.to_string())),
-
-        Value::Bool(b) => state
-            .new_value_bool(*b)
-            .map_err(|e| NixError::evaluation(e.to_string())),
-
-        Value::Int(i) => state
-            .new_value_int(*i)
-            .map_err(|e| NixError::evaluation(e.to_string())),
-
-        Value::Float(f) => state
-            .new_value_float(*f)
-            .map_err(|e| NixError::evaluation(e.to_string())),
-
-        Value::String(s) => state
-            .new_value_str(s)
-            .map_err(|e| NixError::evaluation(e.to_string())),
-
-        Value::Path(p) => state
-            .new_value_path(&p.to_string_lossy())
-            .map_err(|e| NixError::evaluation(e.to_string())),
-
-        Value::List(items) => {
-            let mut nix_items = Vec::with_capacity(items.len());
-            for item in items {
-                nix_items.push(value_to_nix(state, item)?);
-            }
-            state
-                .new_value_list(nix_items)
-                .map_err(|e| NixError::evaluation(e.to_string()))
-        }
-
-        Value::Attrs(attrs) => {
-            let mut nix_attrs = Vec::with_capacity(attrs.len());
-            for (k, v) in attrs {
-                nix_attrs.push((k.clone(), value_to_nix(state, v)?));
-            }
-            state
-                .new_value_attrs(nix_attrs)
-                .map_err(|e| NixError::evaluation(e.to_string()))
-        }
-
-        Value::Lambda => {
-            Err(NixError::conversion(
-                "cannot convert lambda to Nix value without context",
-            ))
-        }
-
-        Value::Derivation(inner) => {
-            value_to_nix(state, inner)
-        }
-    }
-}
-
-/// Lazy value wrapper that defers conversion until needed.
-pub struct LazyValue {
-    nix_value: NixBindingsValue,
-    cached: Option<Value>,
-}
-
-impl LazyValue {
-    /// Create a new lazy value.
-    pub fn new(nix_value: NixBindingsValue) -> Self {
-        Self {
-            nix_value,
-            cached: None,
         }
     }
 
-    /// Get the underlying Nix value.
-    pub fn nix_value(&self) -> &NixBindingsValue {
-        &self.nix_value
-    }
-
-    /// Force evaluation and convert to our Value type.
-    pub fn force(&mut self, state: &mut EvalState) -> NixResult<&Value> {
-        if self.cached.is_none() {
-            let value = nix_to_value(state, &self.nix_value)?;
-            self.cached = Some(value);
-        }
-        Ok(self.cached.as_ref().unwrap())
-    }
-
-    /// Take the converted value, consuming self.
-    pub fn into_value(mut self, state: &mut EvalState) -> NixResult<Value> {
-        self.force(state)?;
-        Ok(self.cached.unwrap())
-    }
-}
-
-/// Parse a nix-bindings error into our error type.
-fn parse_nix_error(err: anyhow::Error, source: &str) -> NixError {
-    let message = err.to_string();
-
-    if let Some(trace) = extract_trace(&message) {
-        return NixError::evaluation_with_trace(message.clone(), trace);
-    }
-
-    if message.contains("syntax error") || message.contains("unexpected") {
-        return NixError::ParseError {
-            file: PathBuf::from(source),
-            message,
-            line: None,
-            column: None,
-        };
-    }
-
-    if message.contains("undefined variable") {
-        return NixError::evaluation(message);
-    }
-
-    if message.contains("attribute") && message.contains("missing") {
-        return NixError::evaluation(message);
-    }
-
-    NixError::Other(err)
-}
-
-/// Extract trace frames from an error message.
-fn extract_trace(message: &str) -> Option<Vec<TraceFrame>> {
-    let mut frames = Vec::new();
-
-    for line in message.lines() {
-        if let Some(at_pos) = line.find(" at ") {
-            let location = &line[at_pos + 4..];
-            if let Some((file, rest)) = location.rsplit_once(':') {
-                if let Some((line_col, _)) = rest.split_once(':') {
-                    if let Ok(line_num) = line_col.parse::<usize>() {
-                        let desc = line[..at_pos].trim().to_string();
-                        frames.push(
-                            TraceFrame::new(desc)
-                                .with_location(PathBuf::from(file), line_num, 1),
-                        );
-                    }
+    // Try installed locations relative to the binary
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            for ext in &["so", "dylib"] {
+                let candidate = exe_dir.join(format!("../lib/libnix_module_plugin.{}", ext));
+                if candidate.exists() {
+                    return Some(candidate);
                 }
             }
         }
     }
 
-    if frames.is_empty() {
-        None
-    } else {
-        Some(frames)
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_lib_nix_from_cwd() {
+        if let Some(path) = find_lib_nix() {
+            assert!(path.exists());
+            assert!(path.to_string_lossy().contains("lib.nix"));
+        }
     }
 }

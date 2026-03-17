@@ -44,6 +44,7 @@
           filter = path: type:
             (pkgs.lib.hasSuffix ".cpp" path) ||
             (pkgs.lib.hasSuffix ".h" path) ||
+            (pkgs.lib.hasSuffix ".nix" path && pkgs.lib.hasInfix "/nix/" path) ||
             (craneLib.filterCargoSources path type);
         };
 
@@ -67,9 +68,16 @@
           inherit cargoArtifacts;
           pname = "nix-module-plugin";
           cargoExtraArgs = "-p nix-module-plugin";
+
+          # Install the shared library to lib/
+          postInstall = ''
+            mkdir -p $out/lib
+            find $out -name 'libnix_module_plugin.so' -o -name 'libnix_module_plugin.dylib' | \
+              while read f; do cp "$f" $out/lib/; done
+          '';
         });
 
-        # Build the CLI
+        # Build the CLI (no longer depends on nix-bindings-rust)
         nix-module-cli = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "nix-module-cli";
@@ -78,7 +86,20 @@
           nativeCheckInputs = with pkgs; [
             nix
           ];
+
+          # Install nix/lib.nix alongside the binary
+          postInstall = ''
+            mkdir -p $out/share/nix-module-system/nix
+            cp ${./nix/lib.nix} $out/share/nix-module-system/nix/lib.nix
+          '';
         });
+
+        # Wrapped CLI that knows where lib.nix and the plugin are
+        nix-module = pkgs.writeShellScriptBin "nix-module" ''
+          export NMS_LIB_PATH="''${NMS_LIB_PATH:-${nix-module-cli}/share/nix-module-system/nix/lib.nix}"
+          export NMS_PLUGIN_PATH="''${NMS_PLUGIN_PATH:-${nix-module-plugin}/lib/libnix_module_plugin.so}"
+          exec ${nix-module-cli}/bin/nix-module "$@"
+        '';
 
         # Clippy checks
         nix-module-system-clippy = craneLib.cargoClippy (commonArgs // {
@@ -98,9 +119,10 @@
 
       in {
         packages = {
-          default = nix-module-cli;
+          default = nix-module;
           cli = nix-module-cli;
           plugin = nix-module-plugin;
+          wrapped = nix-module;
           doc = nix-module-system-doc;
         };
 
@@ -110,6 +132,8 @@
 
         devShells.default = craneLib.devShell {
           inputsFrom = [ nix-module-cli nix-module-plugin ];
+
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
           packages = with pkgs; [
             # Rust tools
@@ -134,8 +158,8 @@
             echo "===================================="
             echo ""
             echo "Crates:"
-            echo "  nix-module-system   Core library"
-            echo "  nix-module-cli      CLI (Rust drives Nix via nix-bindings)"
+            echo "  nix-module-system   Core library (merge engine, types)"
+            echo "  nix-module-cli      CLI (drives nix eval subprocess)"
             echo "  nix-module-plugin   Nix plugin (Nix loads Rust cdylib)"
             echo ""
             echo "Commands:"
@@ -143,15 +167,19 @@
             echo "  cargo build -p nix-module-plugin    Build the plugin"
             echo "  cargo test                          Run all tests"
             echo ""
-            echo "To test the plugin:"
-            echo "  nix eval --plugin-files ./target/release/libnix_module_plugin.so --expr '...'"
+            echo "Evaluate with plugin:"
+            echo "  nix eval --plugin-files ./target/release/libnix_module_plugin.so \\"
+            echo "    --impure --json --expr 'let lib = import ./nix/lib.nix; in lib.evalModules { modules = [ ./nix/examples/nginx-example.nix ]; }'"
+            echo ""
+            echo "Evaluate without plugin (pure Nix fallback):"
+            echo "  nix eval --impure --json --expr 'let lib = import ./nix/lib.nix; in lib.evalModules { modules = [ ./nix/examples/nginx-example.nix ]; }'"
           '';
         };
 
         # For nix run
         apps.default = {
           type = "app";
-          program = "${nix-module-cli}/bin/nix-module";
+          program = "${nix-module}/bin/nix-module";
         };
       });
 }
